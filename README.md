@@ -24,12 +24,15 @@ Monitor de processos e ferramentas de Inteligência Artificial em tempo real par
 
 ## 📦 Como Usar o Executável
 
-1. Dê dois cliques em **`AIProcessMonitor.exe`**.
-2. O servidor iniciará e o seu navegador padrão abrirá automaticamente em:
+1. **Modo Janela Nativa (Padrão):**
+   * Dê dois cliques em **`AIProcessMonitor.exe`**.
+   * Uma janela nativa de desktop Windows abrirá diretamente na sua tela com tema escuro moderno, métricas em tempo real, alertas de ação humana e botões para focar janelas (**sem precisar de navegador!**).
+   * Se desejar visualizar pelo navegador, basta clicar no botão **"🌐 Abrir no Navegador"** no topo da janela.
+
+2. **Modo Headless / Servidor em Segundo Plano:**
+   ```powershell
+   .\AIProcessMonitor.exe --headless
    ```
-   http://localhost:3333
-   ```
-3. Para encerrar, basta fechar a janela do terminal ou pressionar `Ctrl + C`.
 
 *(Opcional: você pode passar uma porta personalizada como argumento: `AIProcessMonitor.exe 4000`)*
 
@@ -48,7 +51,7 @@ Monitor de processos e ferramentas de Inteligência Artificial em tempo real par
 Para recompilar o executável a qualquer momento:
 * Execute o arquivo `build.bat` ou rode no PowerShell:
   ```powershell
-  & "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /optimize+ /target:exe /out:AIProcessMonitor.exe /r:System.dll /r:System.Core.dll /r:System.Management.dll /r:System.Web.Extensions.dll /resource:public\index.html,index.html Program.cs
+  & "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /optimize+ /target:winexe /out:AIProcessMonitor.exe /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Management.dll /r:System.Web.Extensions.dll /resource:public\index.html,index.html Program.cs
   ```
 
 ---
@@ -56,13 +59,13 @@ Para recompilar o executável a qualquer momento:
 ## 📁 Estrutura do Projeto
 
 ```
-C:\Dev\AIProcessMonitor\
-├── AIProcessMonitor.exe   # Executável nativo standalone
-├── Program.cs             # Código-fonte em C# (.NET Framework)
+C:\Users\Julian\Dev\AIProcessMonitor\
+├── AIProcessMonitor.exe   # Executável nativo standalone (GUI Windows nativa + API)
+├── Program.cs             # Código-fonte em C# (.NET Framework 4.0)
 ├── build.bat              # Script de compilação em 1 clique
 ├── server.mjs             # Servidor alternativo em Node.js
 ├── scanner.ps1            # Script de inspeção de processos
 ├── public/
-│   └── index.html         # Frontend moderno (HTML, CSS e JavaScript)
+│   └── index.html         # Frontend web integrado (HTML, CSS e JavaScript)
 └── README.md
 ```

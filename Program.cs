@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Management;
@@ -8,19 +9,20 @@ using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
+using System.Windows.Forms;
 
 namespace AIProcessMonitor
 {
-    class Program
+    public static class Program
     {
-        private static int port = 3333;
+        public static int port = 3333;
         private static HttpListener listener;
         private static string embeddedHtml = null;
         private static readonly object cacheLock = new object();
         private static string cachedJson = null;
+        private static List<ProcessInfo> cachedProcessList = new List<ProcessInfo>();
         private static DateTime lastScanTime = DateTime.MinValue;
 
         #region Win32 API Imports for Desktop & Window Management
@@ -86,11 +88,9 @@ namespace AIProcessMonitor
         private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
         #endregion
 
+        [STAThread]
         static void Main(string[] args)
         {
-            Console.Title = "AI Process Monitor • Server & API";
-            Console.OutputEncoding = Encoding.UTF8;
-
             LoadEmbeddedHtml();
 
             int customPort;
@@ -99,7 +99,43 @@ namespace AIProcessMonitor
                 port = customPort;
             }
 
+            bool headless = false;
+            foreach (var a in args)
+            {
+                if (a.Equals("--headless", StringComparison.OrdinalIgnoreCase) ||
+                    a.Equals("--no-gui", StringComparison.OrdinalIgnoreCase))
+                {
+                    headless = true;
+                }
+            }
+
+            // Start HTTP API server in background thread
             StartServer();
+
+            if (headless)
+            {
+                var exitEvent = new ManualResetEvent(false);
+                Console.CancelKeyPress += (s, e) => { e.Cancel = true; exitEvent.Set(); };
+                exitEvent.WaitOne();
+                try { if (listener != null) listener.Stop(); } catch { }
+            }
+            else
+            {
+                try
+                {
+                    Application.EnableVisualStyles();
+                    Application.SetCompatibleTextRenderingDefault(false);
+                    Application.Run(new MainForm(port));
+                }
+                catch (Exception ex)
+                {
+                    try
+                    {
+                        File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "error.log"), ex.ToString());
+                    }
+                    catch { }
+                }
+            }
         }
 
         private static void LoadEmbeddedHtml()
@@ -117,21 +153,22 @@ namespace AIProcessMonitor
 
             try
             {
-                var asm = Assembly.GetExecutingAssembly();
-                using (var stream = asm.GetManifestResourceStream("index.html"))
+                var assembly = Assembly.GetExecutingAssembly();
+                using (var stream = assembly.GetManifestResourceStream("index.html"))
                 {
                     if (stream != null)
                     {
                         using (var reader = new StreamReader(stream, Encoding.UTF8))
                         {
                             embeddedHtml = reader.ReadToEnd();
+                            return;
                         }
                     }
                 }
             }
             catch { }
 
-            if (string.IsNullOrEmpty(embeddedHtml))
+            if (embeddedHtml == null)
             {
                 embeddedHtml = "<html><body><h1>AI Process Monitor</h1></body></html>";
             }
@@ -155,48 +192,10 @@ namespace AIProcessMonitor
                 }
             }
 
-            if (!started)
+            if (started)
             {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine("[ERRO] Não foi possível iniciar o servidor HTTP entre as portas 3333 e 3400.");
-                Console.ResetColor();
-                return;
+                ThreadPool.QueueUserWorkItem(ListenLoop);
             }
-
-            Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.WriteLine("===============================================================");
-            Console.WriteLine("        ⚡ AI PROCESS MONITOR • NATIVE EXECUTABLE ⚡          ");
-            Console.WriteLine("===============================================================");
-            Console.ResetColor();
-            Console.WriteLine("  🌐 Painel Web   : http://localhost:" + port);
-            Console.WriteLine("  📡 JSON da API  : http://localhost:" + port + "/api/processes");
-            Console.WriteLine("  🎯 Focar Janela : http://localhost:" + port + "/api/focus?pid={pid}");
-            Console.WriteLine("---------------------------------------------------------------");
-            Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine("  [ONLINE] Monitorando processos de IA com alertas de ação humana!");
-            Console.ResetColor();
-            Console.WriteLine("  Dica: Clique no processo no navegador para abrir a janela.");
-            Console.WriteLine("  Pressione [Ctrl+C] ou feche esta janela para encerrar.");
-            Console.WriteLine("===============================================================\n");
-
-            try
-            {
-                Process.Start(new ProcessStartInfo("http://localhost:" + port) { UseShellExecute = true });
-            }
-            catch { }
-
-            ThreadPool.QueueUserWorkItem(ListenLoop);
-
-            var exitEvent = new ManualResetEvent(false);
-            Console.CancelKeyPress += (s, e) =>
-            {
-                e.Cancel = true;
-                exitEvent.Set();
-            };
-            exitEvent.WaitOne();
-
-            Console.WriteLine("\n[ENCERRANDO] Finalizando o servidor...");
-            try { listener.Stop(); } catch { }
         }
 
         private static void ListenLoop(object state)
@@ -221,9 +220,9 @@ namespace AIProcessMonitor
             var req = ctx.Request;
             var res = ctx.Response;
 
-            res.AddHeader("Access-Control-Allow-Origin", "*");
-            res.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            res.AddHeader("Access-Control-Allow-Headers", "Content-Type");
+            res.Headers.Add("Access-Control-Allow-Origin", "*");
+            res.Headers.Add("Access-Control-Allow-Methods", "GET, OPTIONS");
+            res.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
 
             if (req.HttpMethod == "OPTIONS")
             {
@@ -232,41 +231,31 @@ namespace AIProcessMonitor
                 return;
             }
 
-            string path = req.Url.AbsolutePath.ToLowerInvariant();
-            var sw = Stopwatch.StartNew();
-
             try
             {
-                // 1. Dashboard HTML
+                string path = req.Url.AbsolutePath;
+
                 if (path == "/" || path == "/index.html")
                 {
-                    string localPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "public", "index.html");
-                    string html = File.Exists(localPath) ? File.ReadAllText(localPath, Encoding.UTF8) : embeddedHtml;
-
-                    byte[] buf = Encoding.UTF8.GetBytes(html);
+                    byte[] buf = Encoding.UTF8.GetBytes(embeddedHtml);
                     res.ContentType = "text/html; charset=utf-8";
                     res.ContentLength64 = buf.Length;
                     res.OutputStream.Write(buf, 0, buf.Length);
                     res.Close();
-                    LogRequest(req.HttpMethod, path, 200, sw.ElapsedMilliseconds);
                     return;
                 }
 
-                // 2. API Processes
                 if (path == "/api/processes")
                 {
                     string json = GetProcessesJson();
                     byte[] buf = Encoding.UTF8.GetBytes(json);
                     res.ContentType = "application/json; charset=utf-8";
-                    res.AddHeader("Cache-Control", "no-cache, no-store, must-revalidate");
                     res.ContentLength64 = buf.Length;
                     res.OutputStream.Write(buf, 0, buf.Length);
                     res.Close();
-                    LogRequest(req.HttpMethod, path, 200, sw.ElapsedMilliseconds);
                     return;
                 }
 
-                // 3. API Focus Window on Click: /api/focus?pid=1234
                 if (path == "/api/focus")
                 {
                     string pidStr = req.QueryString["pid"];
@@ -292,11 +281,9 @@ namespace AIProcessMonitor
                     res.ContentLength64 = buf.Length;
                     res.OutputStream.Write(buf, 0, buf.Length);
                     res.Close();
-                    LogRequest(req.HttpMethod, path + "?pid=" + pidStr, success ? 200 : 400, sw.ElapsedMilliseconds);
                     return;
                 }
 
-                // 4. API Health
                 if (path == "/api/health")
                 {
                     var ser = new JavaScriptSerializer();
@@ -305,23 +292,21 @@ namespace AIProcessMonitor
                         status = "ok",
                         timestamp = DateTime.UtcNow.ToString("o")
                     });
+
                     byte[] buf = Encoding.UTF8.GetBytes(json);
                     res.ContentType = "application/json; charset=utf-8";
                     res.ContentLength64 = buf.Length;
                     res.OutputStream.Write(buf, 0, buf.Length);
                     res.Close();
-                    LogRequest(req.HttpMethod, path, 200, sw.ElapsedMilliseconds);
                     return;
                 }
 
-                // 404
                 res.StatusCode = 404;
                 byte[] notFoundBuf = Encoding.UTF8.GetBytes("{\"error\":\"Endpoint não encontrado\"}");
                 res.ContentType = "application/json; charset=utf-8";
                 res.ContentLength64 = notFoundBuf.Length;
                 res.OutputStream.Write(notFoundBuf, 0, notFoundBuf.Length);
                 res.Close();
-                LogRequest(req.HttpMethod, path, 404, sw.ElapsedMilliseconds);
             }
             catch (Exception ex)
             {
@@ -335,19 +320,11 @@ namespace AIProcessMonitor
                     res.Close();
                 }
                 catch { }
-                LogRequest(req.HttpMethod, path, 500, sw.ElapsedMilliseconds);
             }
         }
 
-        private static void LogRequest(string method, string path, int code, long ms)
-        {
-            Console.ForegroundColor = code == 200 ? ConsoleColor.DarkGray : ConsoleColor.Yellow;
-            Console.WriteLine(string.Format("[{0:HH:mm:ss}] {1} {2} -> {3} ({4}ms)", DateTime.Now, method, path, code, ms));
-            Console.ResetColor();
-        }
-
-        #region Window Focus Logic (Requisito 2 - Robust Desktop Window Activation)
-        private static bool ActivateHwnd(IntPtr hWnd)
+        #region Window Focus Logic
+        public static bool ActivateHwnd(IntPtr hWnd)
         {
             try
             {
@@ -360,10 +337,8 @@ namespace AIProcessMonitor
                     ShowWindow(hWnd, 5); // SW_SHOW
                 }
 
-                // Strategy 1: SwitchToThisWindow forces taskbar switch across desktop boundaries
                 try { SwitchToThisWindow(hWnd, true); } catch { }
 
-                // Strategy 2: AttachThreadInput bypass to overcome Windows foreground locks
                 try
                 {
                     IntPtr fgHwnd = GetForegroundWindow();
@@ -383,7 +358,6 @@ namespace AIProcessMonitor
                 }
                 catch { }
 
-                // Strategy 3: Virtual ALT key event bypass
                 keybd_event(0x12, 0, 0, UIntPtr.Zero);
                 keybd_event(0x12, 0, 2, UIntPtr.Zero);
 
@@ -404,7 +378,6 @@ namespace AIProcessMonitor
                 try { p = Process.GetProcessById(targetPid); } catch { }
                 string pName = p != null ? p.ProcessName : "";
 
-                // Build family tree of PIDs (ancestors and children)
                 var familyPids = new HashSet<int>();
                 familyPids.Add(targetPid);
 
@@ -427,7 +400,6 @@ namespace AIProcessMonitor
                             catch { }
                         }
 
-                        // Trace ancestors (e.g. agy -> powershell -> WindowsTerminal)
                         int curr = targetPid;
                         int depth = 0;
                         while (depth < 8 && parentMap.ContainsKey(curr))
@@ -437,7 +409,6 @@ namespace AIProcessMonitor
                             depth++;
                         }
 
-                        // Add children
                         if (childrenMap.ContainsKey(targetPid))
                         {
                             foreach (int ch in childrenMap[targetPid]) familyPids.Add(ch);
@@ -449,7 +420,7 @@ namespace AIProcessMonitor
                 IntPtr foundHwnd = IntPtr.Zero;
                 string foundTitle = "";
 
-                // Tier 1: Check MainWindowHandle directly on target & family processes
+                // Tier 1: Check MainWindowHandle on target & family processes
                 foreach (int pid in familyPids)
                 {
                     try
@@ -471,7 +442,6 @@ namespace AIProcessMonitor
                     catch { }
                 }
 
-                // Helper window callback
                 EnumDesktopWindowsProc matchPidCallback = (hWnd, lParam) =>
                 {
                     uint winPid;
@@ -516,7 +486,7 @@ namespace AIProcessMonitor
                     EnumWindows((hWnd, lParam) => matchPidCallback(hWnd, lParam), IntPtr.Zero);
                 }
 
-                // Tier 4: Fallback search by friendly application keywords
+                // Tier 4: Fallback search by friendly keywords
                 if (foundHwnd == IntPtr.Zero)
                 {
                     string fallbackKeyword = "";
@@ -573,8 +543,8 @@ namespace AIProcessMonitor
         }
         #endregion
 
-        #region Process Scanning & Accurate Human Action Detection (Requisito 1)
-        private static string GetProcessesJson()
+        #region Process Scanning & Human Action Detection
+        public static string GetProcessesJson()
         {
             lock (cacheLock)
             {
@@ -587,6 +557,7 @@ namespace AIProcessMonitor
                 var list = ScanProcesses();
                 sw.Stop();
 
+                cachedProcessList = list;
                 double totalMem = list.Sum(p => p.memoryMB);
 
                 var payload = new
@@ -606,43 +577,23 @@ namespace AIProcessMonitor
             }
         }
 
-        private static List<ProcessInfo> ScanProcesses()
+        public static List<ProcessInfo> ScanProcesses()
         {
-            var results = new List<ProcessInfo>();
-            DateTime now = DateTime.Now;
-
-            string targetRegex = @"(?i)^(agy|cloudcode_cli|M365Copilot|ollama.*|lmstudio.*|lms|koboldcpp|jan|anythingllm|localai|vllm|tabby|cursor|claude|chatbox|msty|comfy.*)$";
-            string aiKeywords = @"(?i)(torch|diffusion|tensor|model|inference|agent|llm|huggingface|gradio|streamlit|langchain|ollama|gemini|antigravity|copilot|claude|server_webcam|duet)";
-
-            var allProcs = Process.GetProcesses();
-            var candidates = new List<Process>();
-
-            foreach (var p in allProcs)
-            {
-                string name = p.ProcessName;
-                if (Regex.IsMatch(name, targetRegex) || name.Equals("node", StringComparison.OrdinalIgnoreCase) || name.StartsWith("python", StringComparison.OrdinalIgnoreCase) || name.Equals("py", StringComparison.OrdinalIgnoreCase))
-                {
-                    candidates.Add(p);
-                }
-            }
-
-            if (candidates.Count == 0) return results;
-
-            // Fetch command lines via WMI
-            var cmdMap = new Dictionary<int, string>();
+            var rawList = new List<RawProc>();
             try
             {
-                var pidFilters = candidates.Select(c => "ProcessId = " + c.Id).ToArray();
-                string query = "SELECT ProcessId, CommandLine FROM Win32_Process WHERE " + string.Join(" OR ", pidFilters);
-                using (var searcher = new ManagementObjectSearcher(query))
+                using (var searcher = new ManagementObjectSearcher(
+                    "SELECT ProcessId, Name, CommandLine, WorkingSetSize FROM Win32_Process"))
                 {
                     foreach (ManagementObject mo in searcher.Get())
                     {
                         try
                         {
                             int pid = Convert.ToInt32(mo["ProcessId"]);
-                            string cmd = mo["CommandLine"] as string;
-                            cmdMap[pid] = cmd ?? "";
+                            string name = mo["Name"] != null ? mo["Name"].ToString() : "";
+                            string cmd = mo["CommandLine"] != null ? mo["CommandLine"].ToString() : "";
+                            ulong ws = mo["WorkingSetSize"] != null ? Convert.ToUInt64(mo["WorkingSetSize"]) : 0;
+                            rawList.Add(new RawProc { Pid = pid, Name = name, CommandLine = cmd, WorkingSet = ws });
                         }
                         catch { }
                     }
@@ -650,164 +601,127 @@ namespace AIProcessMonitor
             }
             catch { }
 
-            // Check if any agent session specifically has an active question or permission prompt
+            var startTimeMap = new Dictionary<int, DateTime>();
+            foreach (var p in Process.GetProcesses())
+            {
+                try { startTimeMap[p.Id] = p.StartTime; } catch { }
+            }
+
+            var aiResults = new List<ProcessInfo>();
             bool isExplicitQuestionPending = CheckActiveAgentPromptWaiting();
 
-            foreach (var p in candidates)
+            foreach (var rp in rawList)
             {
-                try
+                string pName = rp.Name ?? "";
+                string pCmd = rp.CommandLine ?? "";
+
+                if (pName.IndexOf("AIProcessMonitor", StringComparison.OrdinalIgnoreCase) >= 0)
+                    continue;
+
+                string friendly = null;
+                string category = null;
+
+                if (pCmd.IndexOf("server_webcam.mjs", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    pCmd.IndexOf("server_webcam", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    int id = p.Id;
-                    string name = p.ProcessName;
-                    string cmd = cmdMap.ContainsKey(id) ? cmdMap[id] : "";
-
-                    bool isAi = false;
-                    string friendlyName = name;
-                    string category = "Outro";
-
-                    if (Regex.IsMatch(name, "agy", RegexOptions.IgnoreCase))
-                    {
-                        isAi = true;
-                        friendlyName = "Google Antigravity CLI";
-                        category = "Agente de IA / CLI";
-                    }
-                    else if (Regex.IsMatch(name, "cloudcode", RegexOptions.IgnoreCase))
-                    {
-                        isAi = true;
-                        friendlyName = "Google Gemini Code Assist";
-                        category = "Assistente de IDE";
-                    }
-                    else if (Regex.IsMatch(name, "M365Copilot|copilot", RegexOptions.IgnoreCase))
-                    {
-                        isAi = true;
-                        friendlyName = "Microsoft Copilot";
-                        category = "App Desktop de IA";
-                    }
-                    else if (Regex.IsMatch(name, "ollama", RegexOptions.IgnoreCase))
-                    {
-                        isAi = true;
-                        friendlyName = "Ollama Server";
-                        category = "Servidor Local de IA";
-                    }
-                    else if (Regex.IsMatch(name, "lmstudio|lms", RegexOptions.IgnoreCase))
-                    {
-                        isAi = true;
-                        friendlyName = "LM Studio";
-                        category = "App Desktop / Servidor Local";
-                    }
-                    else if (Regex.IsMatch(name, "cursor", RegexOptions.IgnoreCase))
-                    {
-                        isAi = true;
-                        friendlyName = "Cursor Editor";
-                        category = "IDE com IA";
-                    }
-                    else if (Regex.IsMatch(name, "claude", RegexOptions.IgnoreCase))
-                    {
-                        isAi = true;
-                        friendlyName = "Claude Desktop";
-                        category = "App Desktop de IA";
-                    }
-                    else if (name.Equals("node", StringComparison.OrdinalIgnoreCase) || name.StartsWith("python", StringComparison.OrdinalIgnoreCase) || name.Equals("py", StringComparison.OrdinalIgnoreCase))
-                    {
-                        if (Regex.IsMatch(cmd, aiKeywords))
-                        {
-                            isAi = true;
-                            if (cmd.IndexOf("server_webcam", StringComparison.OrdinalIgnoreCase) >= 0)
-                            {
-                                friendlyName = "Assistente Visual por Voz com IA";
-                                category = "Aplicação Web / Assistente";
-                            }
-                            else
-                            {
-                                friendlyName = name + " [IA Script]";
-                                category = "Script de IA";
-                            }
-                        }
-                    }
-
-                    if (isAi)
-                    {
-                        DateTime startTime = DateTime.MinValue;
-                        try { startTime = p.StartTime; } catch { }
-
-                        double totalSec = 0;
-                        string uptimeStr = "N/A";
-                        string startStr = "N/A";
-
-                        if (startTime != DateTime.MinValue)
-                        {
-                            TimeSpan diff = now - startTime;
-                            totalSec = Math.Floor(diff.TotalSeconds);
-                            var parts = new List<string>();
-                            if (diff.Days > 0) parts.Add(diff.Days + "d");
-                            if (diff.Hours > 0) parts.Add(diff.Hours + "h");
-                            if (diff.Minutes > 0) parts.Add(diff.Minutes + "m");
-                            parts.Add(diff.Seconds + "s");
-                            uptimeStr = string.Join(" ", parts.ToArray());
-                            startStr = startTime.ToString("yyyy-MM-dd HH:mm:ss");
-                        }
-
-                        double memMB = 0;
-                        try { memMB = Math.Round(p.WorkingSet64 / 1048576.0, 1); } catch { }
-
-                        // ACCURATE HUMAN ACTION DETECTION (NO FALSE ALARMS)
-                        string statusReason;
-                        bool needsHuman = CheckRealHumanActionRequired(p, name, cmd, isExplicitQuestionPending, out statusReason);
-
-                        results.Add(new ProcessInfo
-                        {
-                            pid = id,
-                            processName = name,
-                            friendlyName = friendlyName,
-                            category = category,
-                            startTime = startStr,
-                            uptimeSeconds = totalSec,
-                            uptimeHuman = uptimeStr,
-                            memoryMB = memMB,
-                            commandLine = cmd,
-                            needsHumanInput = needsHuman,
-                            statusReason = statusReason
-                        });
-                    }
+                    friendly = "Assistente Visual por Voz com IA";
+                    category = "Aplicação Web / Assistente";
                 }
-                catch { }
+                else if (pName.IndexOf("cloudcode", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         pCmd.IndexOf("cloudcode_cli", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    friendly = "Google Gemini Code Assist";
+                    category = "Assistente de IDE";
+                }
+                else if (pName.IndexOf("M365Copilot", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         pCmd.IndexOf("M365Copilot", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    friendly = "Microsoft Copilot";
+                    category = "App Desktop de IA";
+                }
+                else if (pName.IndexOf("agy", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         pCmd.IndexOf("\\agy.exe", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         pCmd.IndexOf("\\agy ", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    friendly = "Google Antigravity CLI";
+                    category = "Agente de IA / CLI";
+                }
+                else if (pCmd.IndexOf("claude", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         pName.IndexOf("claude", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    friendly = "Anthropic Claude";
+                    category = "Assistente de IA";
+                }
+                else if (pCmd.IndexOf("ollama", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         pName.IndexOf("ollama", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    friendly = "Ollama Local LLM";
+                    category = "Servidor de IA Local";
+                }
+
+                if (friendly != null)
+                {
+                    DateTime start = DateTime.Now;
+                    if (startTimeMap.ContainsKey(rp.Pid)) start = startTimeMap[rp.Pid];
+
+                    double uptimeSec = Math.Max(0, (DateTime.Now - start).TotalSeconds);
+                    double memMB = Math.Round(rp.WorkingSet / (1024.0 * 1024.0), 1);
+
+                    string statusReason;
+                    bool needsInput = DetermineAccurateHumanAction(rp.Pid, pName, pCmd, isExplicitQuestionPending, out statusReason);
+
+                    string cleanName = pName;
+                    if (cleanName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                        cleanName = cleanName.Substring(0, cleanName.Length - 4);
+
+                    aiResults.Add(new ProcessInfo
+                    {
+                        pid = rp.Pid,
+                        processName = cleanName,
+                        friendlyName = friendly,
+                        category = category,
+                        startTime = start.ToString("yyyy-MM-dd HH:mm:ss"),
+                        uptimeSeconds = Math.Round(uptimeSec),
+                        uptimeHuman = FormatUptime(uptimeSec),
+                        memoryMB = memMB,
+                        commandLine = pCmd,
+                        needsHumanInput = needsInput,
+                        statusReason = statusReason
+                    });
+                }
             }
 
-            return results;
+            return aiResults.OrderByDescending(p => p.needsHumanInput)
+                            .ThenByDescending(p => p.memoryMB)
+                            .ToList();
         }
 
-        /// <summary>
-        /// Real, accurate check for whether a process TRULY needs human action right now:
-        /// 1. Modal dialog, confirmation popup or prompt window waiting on screen.
-        /// 2. Window title specifically indicating a question, approval, or input prompt.
-        /// 3. An active unanswered question or permission prompt explicitly presented to the user.
-        /// </summary>
-        private static bool CheckRealHumanActionRequired(Process p, string name, string cmd, bool isExplicitQuestionPending, out string statusReason)
+        private static bool DetermineAccurateHumanAction(int pid, string name, string cmd, bool isExplicitQuestionPending, out string statusReason)
         {
-            statusReason = "Ativo";
+            statusReason = "Em execução";
 
-            // 1. Any GUI window with a modal confirmation popup / dialog waiting for human response
             try
             {
-                if (p.MainWindowHandle != IntPtr.Zero)
+                var proc = Process.GetProcessById(pid);
+                IntPtr hMain = proc.MainWindowHandle;
+                if (hMain != IntPtr.Zero)
                 {
-                    IntPtr popup = GetWindow(p.MainWindowHandle, GW_ENABLEDPOPUP);
-                    if (popup != IntPtr.Zero && popup != p.MainWindowHandle && IsWindowVisible(popup))
+                    IntPtr hPopup = GetWindow(hMain, GW_ENABLEDPOPUP);
+                    if (hPopup != IntPtr.Zero && hPopup != hMain)
                     {
-                        statusReason = "Caixa de diálogo / Confirmação aguardando resposta";
+                        var sbPopup = new StringBuilder(256);
+                        GetWindowText(hPopup, sbPopup, 256);
+                        statusReason = "Janela modal ou diálogo de confirmação aberto";
                         return true;
                     }
-                }
-            }
-            catch { }
 
-            // 2. Window Title explicitly asking for human confirmation, permission or prompt
-            try
-            {
-                if (p.MainWindowHandle != IntPtr.Zero && !string.IsNullOrEmpty(p.MainWindowTitle))
-                {
-                    string title = p.MainWindowTitle;
-                    if (Regex.IsMatch(title, @"(?i)(aguardando|confirmar|confirm|pergunta|autorizar|permission|approval|\?)"))
+                    var sbTitle = new StringBuilder(512);
+                    GetWindowText(hMain, sbTitle, 512);
+                    string title = sbTitle.ToString().ToLowerInvariant();
+
+                    if (title.Contains("confirm") || title.Contains("autoriz") ||
+                        title.Contains("aguardando") || title.Contains("permissão") ||
+                        title.Contains("input required") || title.Contains("y/n"))
                     {
                         statusReason = "Aguardando confirmação na janela";
                         return true;
@@ -816,42 +730,26 @@ namespace AIProcessMonitor
             }
             catch { }
 
-            // 3. Explicit question / prompt pending in agent session
             if (isExplicitQuestionPending && name.IndexOf("agy", StringComparison.OrdinalIgnoreCase) >= 0)
             {
                 statusReason = "Pergunta ou confirmação aguardando resposta humana";
                 return true;
             }
 
-            // Normal process statuses (clean and informative, NO false alarms)
             if (cmd.IndexOf("server_webcam", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
                 statusReason = "Servidor Web Ativo";
-            }
             else if (name.IndexOf("cloudcode", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
                 statusReason = "Serviço IDE Ativo";
-            }
             else if (name.IndexOf("M365Copilot", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
                 statusReason = "Em segundo plano";
-            }
             else if (name.IndexOf("agy", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
                 statusReason = "Agente CLI Ativo";
-            }
             else
-            {
                 statusReason = "Em execução";
-            }
 
             return false;
         }
 
-        /// <summary>
-        /// Checks if there is an explicit UNANSWERED question or confirmation prompt presented by the agent
-        /// (e.g. ask_question tool or permission check).
-        /// </summary>
         private static bool CheckActiveAgentPromptWaiting()
         {
             try
@@ -881,7 +779,6 @@ namespace AIProcessMonitor
 
                             if (lastLine != null)
                             {
-                                // Only trigger if the assistant is explicitly blocked waiting on ask_question
                                 if (lastLine.Contains("\"ask_question\"") && !lastLine.Contains("\"type\":\"USER_INPUT\""))
                                 {
                                     return true;
@@ -895,8 +792,636 @@ namespace AIProcessMonitor
 
             return false;
         }
+
+        public static string FormatUptime(double seconds)
+        {
+            var ts = TimeSpan.FromSeconds(seconds);
+            if (ts.TotalDays >= 1)
+                return string.Format("{0}d {1}h {2}m", (int)ts.TotalDays, ts.Hours, ts.Minutes);
+            if (ts.TotalHours >= 1)
+                return string.Format("{0}h {1}m {2}s", (int)ts.TotalHours, ts.Minutes, ts.Seconds);
+            if (ts.TotalMinutes >= 1)
+                return string.Format("{0}m {1}s", (int)ts.TotalMinutes, ts.Seconds);
+            return string.Format("{0}s", (int)ts.TotalSeconds);
+        }
+
+        private class RawProc
+        {
+            public int Pid { get; set; }
+            public string Name { get; set; }
+            public string CommandLine { get; set; }
+            public ulong WorkingSet { get; set; }
+        }
         #endregion
     }
+
+    #region Native Windows Forms Desktop GUI (Requisito: Tela direta no EXE sem precisar de browser)
+    public class MainForm : Form
+    {
+        private int apiPort;
+        private System.Windows.Forms.Timer refreshTimer;
+        private List<ProcessInfo> currentProcesses = new List<ProcessInfo>();
+        private bool isScanning = false;
+        private bool hadAlertBefore = false;
+
+        // UI Controls
+        private Panel headerPanel;
+        private Label lblTitle;
+        private Label lblSubtitle;
+        private Label lblCountValue;
+        private Label lblMemValue;
+        private Label lblAlertValue;
+        private Panel alertBanner;
+        private Label lblAlertBanner;
+        private Button btnAlertFocus;
+        private DataGridView dgv;
+        private StatusStrip statusStrip;
+        private ToolStripStatusLabel statusLabel;
+        private ToolStripStatusLabel actionLabel;
+        private ComboBox cmbInterval;
+        private Button btnRefreshNow;
+        private Button btnOpenBrowser;
+        private NotifyIcon trayIcon;
+
+        public MainForm(int port)
+        {
+            this.apiPort = port;
+            InitializeComponent();
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            RefreshData();
+        }
+
+        private void InitializeComponent()
+        {
+            this.Text = "⚡ AI Process Monitor • Painel Nativo";
+            this.Size = new Size(1180, 720);
+            this.MinimumSize = new Size(950, 580);
+            this.StartPosition = FormStartPosition.CenterScreen;
+            this.BackColor = Color.FromArgb(15, 23, 42); // slate-900
+            this.ForeColor = Color.FromArgb(248, 250, 252);
+            this.Font = new Font("Segoe UI", 9.5f, FontStyle.Regular);
+            this.DoubleBuffered = true;
+
+            try { this.Icon = SystemIcons.Application; } catch { }
+
+            // 1. Header Panel
+            headerPanel = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 120,
+                BackColor = Color.FromArgb(30, 41, 59), // slate-800
+                Padding = new Padding(20, 12, 20, 12)
+            };
+
+            lblTitle = new Label
+            {
+                Text = "⚡ AI PROCESS MONITOR",
+                Font = new Font("Segoe UI", 15f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(248, 250, 252),
+                AutoSize = true,
+                Location = new Point(20, 14)
+            };
+
+            lblSubtitle = new Label
+            {
+                Text = "Painel nativo em tempo real • Monitoramento de Processos de IA e Ação Humana",
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
+                ForeColor = Color.FromArgb(148, 163, 184),
+                AutoSize = true,
+                Location = new Point(22, 44)
+            };
+
+            // Metrics Cards in Header
+            Panel cardProcs = CreateMetricCard("PROCESSOS ATIVOS", "0", Color.FromArgb(56, 189, 248), 20, 68, out lblCountValue);
+            Panel cardMem = CreateMetricCard("MEMÓRIA RAM TOTAL", "0 MB", Color.FromArgb(192, 132, 252), 190, 68, out lblMemValue);
+            Panel cardAlert = CreateMetricCard("ALERTAS DE AÇÃO", "0", Color.FromArgb(34, 197, 94), 370, 68, out lblAlertValue);
+
+            // Right-aligned controls
+            btnOpenBrowser = new Button
+            {
+                Text = "🌐 Abrir no Navegador",
+                Size = new Size(160, 34),
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
+                Location = new Point(headerPanel.Width - 180, 14),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(37, 99, 235), // blue-600
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+            };
+            btnOpenBrowser.FlatAppearance.BorderSize = 0;
+            btnOpenBrowser.Click += (s, e) =>
+            {
+                try { Process.Start(new ProcessStartInfo("http://localhost:" + apiPort) { UseShellExecute = true }); } catch { }
+            };
+
+            btnRefreshNow = new Button
+            {
+                Text = "🔄 Atualizar",
+                Size = new Size(100, 34),
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
+                Location = new Point(headerPanel.Width - 290, 14),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9f, FontStyle.Regular)
+            };
+            btnRefreshNow.FlatAppearance.BorderSize = 0;
+            btnRefreshNow.Click += (s, e) => RefreshData();
+
+            Label lblInterval = new Label
+            {
+                Text = "Taxa:",
+                ForeColor = Color.FromArgb(148, 163, 184),
+                AutoSize = true,
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
+                Location = new Point(headerPanel.Width - 410, 22)
+            };
+
+            cmbInterval = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Width = 95,
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
+                Location = new Point(headerPanel.Width - 365, 18),
+                BackColor = Color.FromArgb(15, 23, 42),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat
+            };
+            cmbInterval.Items.AddRange(new object[] { "1 segundo", "2 segundos", "5 segundos" });
+            cmbInterval.SelectedIndex = 1;
+            cmbInterval.SelectedIndexChanged += (s, e) =>
+            {
+                int ms = 2000;
+                if (cmbInterval.SelectedIndex == 0) ms = 1000;
+                else if (cmbInterval.SelectedIndex == 2) ms = 5000;
+                refreshTimer.Interval = ms;
+            };
+
+            headerPanel.Controls.Add(lblTitle);
+            headerPanel.Controls.Add(lblSubtitle);
+            headerPanel.Controls.Add(cardProcs);
+            headerPanel.Controls.Add(cardMem);
+            headerPanel.Controls.Add(cardAlert);
+            headerPanel.Controls.Add(lblInterval);
+            headerPanel.Controls.Add(cmbInterval);
+            headerPanel.Controls.Add(btnRefreshNow);
+            headerPanel.Controls.Add(btnOpenBrowser);
+
+            headerPanel.Resize += (s, e) =>
+            {
+                btnOpenBrowser.Location = new Point(headerPanel.Width - 180, 14);
+                btnRefreshNow.Location = new Point(headerPanel.Width - 290, 14);
+                cmbInterval.Location = new Point(headerPanel.Width - 395, 18);
+                lblInterval.Location = new Point(headerPanel.Width - 440, 22);
+            };
+
+            // 2. Alert Banner Panel (Red alert when human action required)
+            alertBanner = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 52,
+                BackColor = Color.FromArgb(127, 29, 29), // red-900
+                Padding = new Padding(20, 8, 20, 8),
+                Visible = false
+            };
+
+            lblAlertBanner = new Label
+            {
+                Text = "🚨 ATENÇÃO: Um ou mais processos de IA estão aguardando sua intervenção humana!",
+                Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
+                ForeColor = Color.White,
+                AutoSize = true,
+                Location = new Point(20, 14)
+            };
+
+            btnAlertFocus = new Button
+            {
+                Text = "🎯 Abrir Janela Agora",
+                Size = new Size(180, 34),
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
+                Location = new Point(alertBanner.Width - 200, 9),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(220, 38, 38), // red-600
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold)
+            };
+            btnAlertFocus.FlatAppearance.BorderSize = 0;
+            btnAlertFocus.Click += (s, e) =>
+            {
+                var alertProc = currentProcesses.FirstOrDefault(p => p.needsHumanInput);
+                if (alertProc != null)
+                {
+                    FocusAndNotify(alertProc.pid, alertProc.friendlyName);
+                }
+            };
+
+            alertBanner.Controls.Add(lblAlertBanner);
+            alertBanner.Controls.Add(btnAlertFocus);
+            alertBanner.Resize += (s, e) =>
+            {
+                btnAlertFocus.Location = new Point(alertBanner.Width - 200, 9);
+            };
+
+            // 3. DataGridView for processes
+            dgv = new DataGridView
+            {
+                Dock = DockStyle.Fill,
+                BackgroundColor = Color.FromArgb(15, 23, 42),
+                GridColor = Color.FromArgb(51, 65, 85),
+                BorderStyle = BorderStyle.None,
+                CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal,
+                AllowUserToAddRows = false,
+                AllowUserToDeleteRows = false,
+                AllowUserToResizeRows = false,
+                ReadOnly = true,
+                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                MultiSelect = false,
+                RowHeadersVisible = false,
+                EnableHeadersVisualStyles = false,
+                RowTemplate = { Height = 46 }
+            };
+
+            dgv.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(15, 23, 42);
+            dgv.ColumnHeadersDefaultCellStyle.ForeColor = Color.FromArgb(148, 163, 184);
+            dgv.ColumnHeadersDefaultCellStyle.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+            dgv.ColumnHeadersDefaultCellStyle.Padding = new Padding(8, 0, 8, 0);
+            dgv.ColumnHeadersHeight = 36;
+            dgv.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
+
+            dgv.DefaultCellStyle.BackColor = Color.FromArgb(30, 41, 59);
+            dgv.DefaultCellStyle.ForeColor = Color.FromArgb(248, 250, 252);
+            dgv.DefaultCellStyle.SelectionBackColor = Color.FromArgb(37, 99, 235);
+            dgv.DefaultCellStyle.SelectionForeColor = Color.White;
+            dgv.DefaultCellStyle.Padding = new Padding(8, 0, 8, 0);
+
+            dgv.AlternatingRowsDefaultCellStyle.BackColor = Color.FromArgb(24, 34, 50);
+
+            // Columns
+            var colStatus = new DataGridViewTextBoxColumn
+            {
+                Name = "colStatus",
+                HeaderText = "STATUS",
+                Width = 175
+            };
+
+            var colName = new DataGridViewTextBoxColumn
+            {
+                Name = "colName",
+                HeaderText = "APLICAÇÃO / IA",
+                Width = 240
+            };
+
+            var colCategory = new DataGridViewTextBoxColumn
+            {
+                Name = "colCategory",
+                HeaderText = "CATEGORIA",
+                Width = 170
+            };
+
+            var colPid = new DataGridViewTextBoxColumn
+            {
+                Name = "colPid",
+                HeaderText = "PID",
+                Width = 75
+            };
+
+            var colMem = new DataGridViewTextBoxColumn
+            {
+                Name = "colMem",
+                HeaderText = "MEMÓRIA",
+                Width = 100
+            };
+
+            var colUptime = new DataGridViewTextBoxColumn
+            {
+                Name = "colUptime",
+                HeaderText = "TEMPO ATIVO",
+                Width = 110
+            };
+
+            var colReason = new DataGridViewTextBoxColumn
+            {
+                Name = "colReason",
+                HeaderText = "DETALHES / MOTIVO",
+                AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+                MinimumWidth = 150
+            };
+
+            var colAction = new DataGridViewButtonColumn
+            {
+                Name = "colAction",
+                HeaderText = "AÇÃO",
+                Width = 130,
+                Text = "🎯 Abrir Janela",
+                UseColumnTextForButtonValue = true,
+                FlatStyle = FlatStyle.Flat
+            };
+            colAction.DefaultCellStyle.BackColor = Color.FromArgb(37, 99, 235);
+            colAction.DefaultCellStyle.ForeColor = Color.White;
+            colAction.DefaultCellStyle.SelectionBackColor = Color.FromArgb(29, 78, 216);
+            colAction.DefaultCellStyle.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+
+            dgv.Columns.AddRange(new DataGridViewColumn[] {
+                colStatus, colName, colCategory, colPid, colMem, colUptime, colReason, colAction
+            });
+
+            dgv.CellContentClick += (s, e) =>
+            {
+                if (e.RowIndex >= 0 && e.ColumnIndex == dgv.Columns["colAction"].Index)
+                {
+                    int pid = Convert.ToInt32(dgv.Rows[e.RowIndex].Cells["colPid"].Value);
+                    string name = dgv.Rows[e.RowIndex].Cells["colName"].Value.ToString();
+                    FocusAndNotify(pid, name);
+                }
+            };
+
+            dgv.CellDoubleClick += (s, e) =>
+            {
+                if (e.RowIndex >= 0)
+                {
+                    int pid = Convert.ToInt32(dgv.Rows[e.RowIndex].Cells["colPid"].Value);
+                    string name = dgv.Rows[e.RowIndex].Cells["colName"].Value.ToString();
+                    FocusAndNotify(pid, name);
+                }
+            };
+
+            // Custom row highlighting for alerts
+            dgv.RowPrePaint += (s, e) =>
+            {
+                if (e.RowIndex >= 0 && e.RowIndex < currentProcesses.Count)
+                {
+                    var proc = currentProcesses[e.RowIndex];
+                    if (proc.needsHumanInput)
+                    {
+                        dgv.Rows[e.RowIndex].DefaultCellStyle.BackColor = Color.FromArgb(69, 10, 10); // red-950
+                        dgv.Rows[e.RowIndex].DefaultCellStyle.ForeColor = Color.FromArgb(254, 202, 202);
+                        dgv.Rows[e.RowIndex].DefaultCellStyle.SelectionBackColor = Color.FromArgb(153, 27, 27);
+                    }
+                }
+            };
+
+            // 4. Status Strip
+            statusStrip = new StatusStrip
+            {
+                BackColor = Color.FromArgb(15, 23, 42),
+                ForeColor = Color.FromArgb(148, 163, 184),
+                Height = 32,
+                SizingGrip = false
+            };
+
+            statusLabel = new ToolStripStatusLabel
+            {
+                Text = "● Monitor Ativo | Servidor da API: http://localhost:" + apiPort,
+                ForeColor = Color.FromArgb(34, 197, 94),
+                Spring = false
+            };
+
+            actionLabel = new ToolStripStatusLabel
+            {
+                Text = "Dica: Clique no botão '🎯 Abrir Janela' ou duplo-clique na linha para focar a janela da aplicação.",
+                ForeColor = Color.FromArgb(148, 163, 184),
+                Spring = true,
+                TextAlign = ContentAlignment.MiddleRight
+            };
+
+            statusStrip.Items.AddRange(new ToolStripItem[] { statusLabel, actionLabel });
+
+            // 5. System Tray Icon
+            try
+            {
+                trayIcon = new NotifyIcon
+                {
+                    Text = "AI Process Monitor",
+                    Icon = SystemIcons.Application,
+                    Visible = true
+                };
+
+                var contextMenu = new ContextMenuStrip();
+                contextMenu.Items.Add("Restaurar Painel", null, (s, e) =>
+                {
+                    this.Show();
+                    this.WindowState = FormWindowState.Normal;
+                    this.BringToFront();
+                });
+                contextMenu.Items.Add("Abrir no Navegador", null, (s, e) =>
+                {
+                    try { Process.Start(new ProcessStartInfo("http://localhost:" + apiPort) { UseShellExecute = true }); } catch { }
+                });
+                contextMenu.Items.Add("-");
+                contextMenu.Items.Add("Sair", null, (s, e) => Application.Exit());
+
+                trayIcon.ContextMenuStrip = contextMenu;
+                trayIcon.DoubleClick += (s, e) =>
+                {
+                    this.Show();
+                    this.WindowState = FormWindowState.Normal;
+                    this.BringToFront();
+                };
+            }
+            catch { }
+
+            // Add controls to Form
+            this.Controls.Add(dgv);
+            this.Controls.Add(alertBanner);
+            this.Controls.Add(headerPanel);
+            this.Controls.Add(statusStrip);
+
+            // Timer for automatic background refresh
+            refreshTimer = new System.Windows.Forms.Timer
+            {
+                Interval = 2000
+            };
+            refreshTimer.Tick += (s, e) => RefreshData();
+            refreshTimer.Start();
+        }
+
+        private Panel CreateMetricCard(string title, string initialValue, Color accentColor, int x, int y, out Label valueLabel)
+        {
+            var pnl = new Panel
+            {
+                Size = new Size(160, 44),
+                Location = new Point(x, y),
+                BackColor = Color.FromArgb(15, 23, 42)
+            };
+
+            var lblT = new Label
+            {
+                Text = title,
+                Font = new Font("Segoe UI", 7.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(148, 163, 184),
+                Location = new Point(8, 4),
+                AutoSize = true
+            };
+
+            var lblV = new Label
+            {
+                Text = initialValue,
+                Font = new Font("Segoe UI", 12f, FontStyle.Bold),
+                ForeColor = accentColor,
+                Location = new Point(8, 20),
+                AutoSize = true
+            };
+
+            pnl.Controls.Add(lblT);
+            pnl.Controls.Add(lblV);
+            valueLabel = lblV;
+            return pnl;
+        }
+
+        private void RefreshData()
+        {
+            if (isScanning) return;
+            isScanning = true;
+
+            ThreadPool.QueueUserWorkItem(state =>
+            {
+                try
+                {
+                    var list = Program.ScanProcesses();
+                    if (this.IsHandleCreated && !this.IsDisposed)
+                    {
+                        this.BeginInvoke((MethodInvoker)delegate
+                        {
+                            try
+                            {
+                                if (!this.IsDisposed)
+                                {
+                                    UpdateGridAndMetrics(list);
+                                }
+                            }
+                            catch { }
+                            finally
+                            {
+                                isScanning = false;
+                            }
+                        });
+                    }
+                    else
+                    {
+                        isScanning = false;
+                    }
+                }
+                catch
+                {
+                    isScanning = false;
+                }
+            });
+        }
+
+        private void UpdateGridAndMetrics(List<ProcessInfo> list)
+        {
+            currentProcesses = list;
+
+            int alertCount = list.Count(p => p.needsHumanInput);
+            double totalMem = Math.Round(list.Sum(p => p.memoryMB), 1);
+
+            lblCountValue.Text = list.Count.ToString();
+            lblMemValue.Text = totalMem + " MB";
+
+            if (alertCount > 0)
+            {
+                lblAlertValue.Text = alertCount.ToString();
+                lblAlertValue.ForeColor = Color.FromArgb(239, 68, 68); // red-500
+
+                var firstAlert = list.First(p => p.needsHumanInput);
+                lblAlertBanner.Text = string.Format("🚨 AÇÃO HUMANA NECESSÁRIA: {0} ({1})", firstAlert.friendlyName, firstAlert.statusReason);
+                alertBanner.Visible = true;
+
+                // Show Tray notification once when alert starts
+                if (!hadAlertBefore && trayIcon != null)
+                {
+                    try
+                    {
+                        trayIcon.ShowBalloonTip(3000, "AI Process Monitor • Alerta",
+                            firstAlert.friendlyName + " está aguardando sua resposta!", ToolTipIcon.Warning);
+                    }
+                    catch { }
+                }
+                hadAlertBefore = true;
+            }
+            else
+            {
+                lblAlertValue.Text = "0";
+                lblAlertValue.ForeColor = Color.FromArgb(34, 197, 94); // green-500
+                alertBanner.Visible = false;
+                hadAlertBefore = false;
+            }
+
+            // Populate / Refresh Grid Rows smoothly
+            int selectedPid = -1;
+            if (dgv.SelectedRows.Count > 0)
+            {
+                try { selectedPid = Convert.ToInt32(dgv.SelectedRows[0].Cells["colPid"].Value); } catch { }
+            }
+
+            dgv.Rows.Clear();
+            foreach (var p in list)
+            {
+                string statusDisplay = p.needsHumanInput ? "🔴 AÇÃO HUMANA" : "🟢 Ativo";
+                string nameDisplay = p.friendlyName + " (" + p.processName + ")";
+
+                int rowIndex = dgv.Rows.Add(
+                    statusDisplay,
+                    nameDisplay,
+                    p.category,
+                    p.pid,
+                    p.memoryMB + " MB",
+                    p.uptimeHuman,
+                    p.statusReason,
+                    "🎯 Abrir Janela"
+                );
+
+                if (p.pid == selectedPid)
+                {
+                    dgv.Rows[rowIndex].Selected = true;
+                }
+            }
+        }
+
+        private void FocusAndNotify(int pid, string friendlyName)
+        {
+            actionLabel.Text = "🎯 Abrindo janela de " + friendlyName + " (PID " + pid + ")...";
+            actionLabel.ForeColor = Color.FromArgb(250, 204, 21); // yellow-400
+
+            ThreadPool.QueueUserWorkItem(state =>
+            {
+                string msg;
+                bool ok = Program.FocusProcessWindow(pid, out msg);
+
+                if (this.IsHandleCreated && !this.IsDisposed)
+                {
+                    this.BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (ok)
+                        {
+                            actionLabel.Text = "✅ " + msg;
+                            actionLabel.ForeColor = Color.FromArgb(34, 197, 94); // green-500
+                        }
+                        else
+                        {
+                            actionLabel.Text = "ℹ️ " + msg;
+                            actionLabel.ForeColor = Color.FromArgb(148, 163, 184);
+                        }
+                    });
+                }
+            });
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (refreshTimer != null) refreshTimer.Stop();
+            if (trayIcon != null) trayIcon.Dispose();
+            base.OnFormClosing(e);
+        }
+    }
+    #endregion
 
     public class ProcessInfo
     {
