@@ -612,8 +612,8 @@
       <div class="brand">
         <div class="brand-icon">⚡</div>
         <div>
-          <h1>AI Process Monitor <span style="font-size: 0.75rem; background: #334155; color: #38bdf8; padding: 2px 8px; border-radius: 9999px; margin-left: 6px; vertical-align: middle;">v1.2.0</span></h1>
-          <p>Painel em tempo real • Clique em qualquer processo para abrir sua janela</p>
+          <h1>AI Process Monitor <span style="font-size: 0.75rem; background: #334155; color: #38bdf8; padding: 2px 8px; border-radius: 9999px; margin-left: 6px; vertical-align: middle;">v1.2.1</span></h1>
+          <p>Painel em tempo real • Dê um duplo-clique em qualquer processo para abrir sua janela</p>
         </div>
       </div>
       <div class="header-actions">
@@ -724,12 +724,11 @@
             <th>Categoria</th>
             <th>Tempo Ativo (Uptime)</th>
             <th>Memória RAM</th>
-            <th>Ação</th>
           </tr>
         </thead>
         <tbody id="processTbody">
           <tr>
-            <td colspan="7" style="text-align: center; padding: 32px; color: var(--text-muted);">
+            <td colspan="6" style="text-align: center; padding: 32px; color: var(--text-muted);">
               Carregando processos...
             </td>
           </tr>
@@ -745,7 +744,7 @@
 
     <!-- Footer -->
     <footer>
-      <span>AI Process Monitor v1.2.0 • Dica: Dê um clique na linha para focar a janela</span>
+      <span>AI Process Monitor v1.2.1 • Dica: Dê um duplo-clique na linha para focar a janela</span>
       <span id="lastUpdatedLabel">Última checagem: --</span>
     </footer>
   </div>
@@ -977,7 +976,7 @@
         const isAlert = !!p.needsHumanInput;
 
         return `
-          <tr class="${isAlert ? 'needs-input' : ''}" onclick="focusWindow(${p.pid}, '${p.friendlyName.replace(/'/g, "\\'")}')" title="Clique para trazer a janela para frente">
+          <tr class="${isAlert ? 'needs-input' : ''}" ondblclick="focusWindow(${p.pid}, '${p.friendlyName.replace(/'/g, "\\'")}')" title="Dê um duplo-clique para abrir a janela da aplicação">
             <td>
               ${isAlert 
                 ? `<span class="status-badge alert" title="${p.statusReason || ''}">🔴 AGUARDANDO AÇÃO HUMANA</span>`
@@ -1006,11 +1005,6 @@
             </td>
             <td>
               <span style="font-family: monospace; font-size: 0.82rem;">${p.memoryMB ? p.memoryMB.toFixed(1) + ' MB' : '--'}</span>
-            </td>
-            <td>
-              <button class="btn-focus-row ${isAlert ? 'alert-btn' : ''}" onclick="focusWindow(${p.pid}, '${p.friendlyName.replace(/'/g, "\\'")}', event)">
-                🎯 Abrir Janela
-              </button>
             </td>
           </tr>
         `;

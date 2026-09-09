@@ -18,15 +18,15 @@ using System.Windows.Forms;
 [assembly: AssemblyCompany("Julianmel")]
 [assembly: AssemblyProduct("AI Process Monitor")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
-[assembly: AssemblyInformationalVersion("1.2.0")]
+[assembly: AssemblyVersion("1.2.1.0")]
+[assembly: AssemblyFileVersion("1.2.1.0")]
+[assembly: AssemblyInformationalVersion("1.2.1")]
 
 namespace AIProcessMonitor
 {
     public static class Program
     {
-        public const string AppVersion = "1.2.0";
+        public const string AppVersion = "1.2.1";
         public const string BuildDate = "2026-09-09";
 
         public static int port = 3333;
@@ -1059,7 +1059,7 @@ namespace AIProcessMonitor
 
             lblSubtitle = new Label
             {
-                Text = "Painel nativo em tempo real • Detecção de IA, Pausas de Terminal e Alertas de Ação Humana",
+                Text = "Painel nativo em tempo real • Dê um duplo-clique na linha para abrir a janela da aplicação",
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
                 ForeColor = Color.FromArgb(148, 163, 184),
                 AutoSize = true,
@@ -1283,44 +1283,39 @@ namespace AIProcessMonitor
                 Name = "colReason",
                 HeaderText = "DETALHES / MOTIVO",
                 AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
-                MinimumWidth = 150
+                MinimumWidth = 180
             };
-
-            var colAction = new DataGridViewButtonColumn
-            {
-                Name = "colAction",
-                HeaderText = "AÇÃO",
-                Width = 130,
-                Text = "🎯 Abrir Janela",
-                UseColumnTextForButtonValue = true,
-                FlatStyle = FlatStyle.Flat
-            };
-            colAction.DefaultCellStyle.BackColor = Color.FromArgb(37, 99, 235);
-            colAction.DefaultCellStyle.ForeColor = Color.White;
-            colAction.DefaultCellStyle.SelectionBackColor = Color.FromArgb(29, 78, 216);
-            colAction.DefaultCellStyle.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
 
             dgv.Columns.AddRange(new DataGridViewColumn[] {
-                colStatus, colName, colCategory, colPid, colMem, colUptime, colReason, colAction
+                colStatus, colName, colCategory, colPid, colMem, colUptime, colReason
             });
-
-            dgv.CellContentClick += (s, e) =>
-            {
-                if (e.RowIndex >= 0 && e.ColumnIndex == dgv.Columns["colAction"].Index)
-                {
-                    int pid = Convert.ToInt32(dgv.Rows[e.RowIndex].Cells["colPid"].Value);
-                    string name = dgv.Rows[e.RowIndex].Cells["colName"].Value.ToString();
-                    FocusAndNotify(pid, name);
-                }
-            };
 
             dgv.CellDoubleClick += (s, e) =>
             {
-                if (e.RowIndex >= 0)
+                if (e.RowIndex >= 0 && e.RowIndex < dgv.Rows.Count)
                 {
-                    int pid = Convert.ToInt32(dgv.Rows[e.RowIndex].Cells["colPid"].Value);
-                    string name = dgv.Rows[e.RowIndex].Cells["colName"].Value.ToString();
-                    FocusAndNotify(pid, name);
+                    try
+                    {
+                        int pid = Convert.ToInt32(dgv.Rows[e.RowIndex].Cells["colPid"].Value);
+                        string name = dgv.Rows[e.RowIndex].Cells["colName"].Value.ToString();
+                        FocusAndNotify(pid, name);
+                    }
+                    catch { }
+                }
+            };
+
+            dgv.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Enter && dgv.SelectedRows.Count > 0)
+                {
+                    e.Handled = true;
+                    try
+                    {
+                        int pid = Convert.ToInt32(dgv.SelectedRows[0].Cells["colPid"].Value);
+                        string name = dgv.SelectedRows[0].Cells["colName"].Value.ToString();
+                        FocusAndNotify(pid, name);
+                    }
+                    catch { }
                 }
             };
 
@@ -1357,7 +1352,7 @@ namespace AIProcessMonitor
 
             actionLabel = new ToolStripStatusLabel
             {
-                Text = "Dica: Clique em '🎯 Abrir Janela' ou duplo-clique na linha para focar a aplicação.",
+                Text = "💡 Dica: Dê um duplo-clique em qualquer linha para abrir a janela da aplicação.",
                 ForeColor = Color.FromArgb(148, 163, 184),
                 Spring = true,
                 TextAlign = ContentAlignment.MiddleRight
@@ -1559,8 +1554,7 @@ namespace AIProcessMonitor
                     p.pid,
                     p.memoryMB + " MB",
                     p.uptimeHuman,
-                    p.statusReason,
-                    "🎯 Abrir Janela"
+                    p.statusReason
                 );
 
                 if (p.pid == selectedPid)
