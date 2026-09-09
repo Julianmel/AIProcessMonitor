@@ -1,0 +1,7 @@
+# Temporary / IDE files
+.vs/
+*.tmp
+*.log
+.vscode/
+Thumbs.db
+Desktop.ini
