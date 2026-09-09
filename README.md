@@ -1,24 +1,17 @@
-# ⚡ AI Process Monitor
+# ⚡ AI Process Monitor `v1.2.0`
 
-Monitor de processos e ferramentas de Inteligência Artificial em tempo real para Windows, com API HTTP local, detecção de necessidade de ação humana e interface web interativa.
-
-![AI Process Monitor](public/index.html)
+Monitor de processos e ferramentas de Inteligência Artificial em tempo real para Windows com interface nativa de desktop, detecção precisa de pausas no terminal para autorização humana e API HTTP local.
 
 ---
 
 ## 🚀 Funcionalidades
 
-* **Monitoramento Universal de IA:** Detecta automaticamente ferramentas e processos de IA ativos:
-  * Google Antigravity CLI (`agy`)
-  * Google Gemini Code Assist (`cloudcode_cli`) no VS Code
-  * Microsoft 365 Copilot (`M365Copilot.exe`)
-  * Modelos locais e servidores de inferência (Ollama, LM Studio, vLLM, ComfyUI, etc.)
-  * Scripts locais de IA (Python com PyTorch/Transformers, LangChain, servidores web locais com IA)
-* **Alerta Vermelho de Ação Humana:** Alerta visual e sonoro quando um processo ou agente de IA precisa da resposta/ação do usuário (prompts de terminal, perguntas interativas ou caixas de diálogo).
-* **Foco de Janela em 1 Clique:** Clique em qualquer linha ou botão na interface para trazer a janela da aplicação ou terminal correspondente diretamente para o primeiro plano.
-* **Taxa de Atualização Configurável:** Alterne entre 1s, 2s, 3s, 5s, 10s ou defina qualquer intervalo personalizado em segundos no navegador, com opção de pausar e atualizar manualmente.
-* **API REST Nativa:** Endpoints JSON para consulta por outras aplicações ou scripts (`/api/processes`, `/api/health`, `/api/focus`).
-* **Executável Nativo Leve:** Compilado em C#/.NET Framework sem dependência de Node.js ou runtime externo.
+* **Controle de Versões Visível na Tela:** Versão `v1.2.0` exibida no título da janela, no badge do cabeçalho, na barra de status e nas respostas da API.
+* **Detecção Inteligente de Pausas no Terminal (Ação Humana):** Detecta instantaneamente quando um agente CLI (como o Google Antigravity `agy`) entra em pausa no terminal aguardando autorização humana para executar comandos (`run_command`), criar/editar arquivos ou responder a perguntas (`ask_question`). Exibe no painel o motivo exato (ex: *"Aguardando autorização: Liberar porta 3000"*).
+* **Interface Nativa Windows (Sem Navegador):** Aplicativo desktop nativo com tema escuro (Dark Mode), cartões de métricas, alertas vermelhos dinâmicos e controle de taxa de atualização.
+* **Foco de Janela em 1 Clique:** Clique em qualquer linha ou no botão *"🎯 Abrir Janela"* para trazer o terminal ou janela correspondente para a frente da tela.
+* **Bandeja do Sistema (System Tray):** Notificações balão no Windows quando uma IA pedir autorização humana.
+* **API REST Nativa:** Endpoints JSON `/api/processes`, `/api/health` e `/api/focus`.
 
 ---
 

@@ -13,10 +13,22 @@ using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
+[assembly: AssemblyTitle("AI Process Monitor")]
+[assembly: AssemblyDescription("Monitor de Processos de IA e Ação Humana em Tempo Real")]
+[assembly: AssemblyCompany("Julianmel")]
+[assembly: AssemblyProduct("AI Process Monitor")]
+[assembly: AssemblyCopyright("Copyright © 2026")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyInformationalVersion("1.2.0")]
+
 namespace AIProcessMonitor
 {
     public static class Program
     {
+        public const string AppVersion = "1.2.0";
+        public const string BuildDate = "2026-09-09";
+
         public static int port = 3333;
         private static HttpListener listener;
         private static string embeddedHtml = null;
@@ -109,7 +121,7 @@ namespace AIProcessMonitor
                 }
             }
 
-            // Start HTTP API server in background thread
+            // Start background HTTP API server
             StartServer();
 
             if (headless)
@@ -273,7 +285,8 @@ namespace AIProcessMonitor
                     {
                         success = success,
                         pid = pidToFocus,
-                        message = message
+                        message = message,
+                        version = AppVersion
                     });
 
                     byte[] buf = Encoding.UTF8.GetBytes(json);
@@ -290,6 +303,8 @@ namespace AIProcessMonitor
                     string json = ser.Serialize(new
                     {
                         status = "ok",
+                        version = AppVersion,
+                        buildDate = BuildDate,
                         timestamp = DateTime.UtcNow.ToString("o")
                     });
 
@@ -420,7 +435,7 @@ namespace AIProcessMonitor
                 IntPtr foundHwnd = IntPtr.Zero;
                 string foundTitle = "";
 
-                // Tier 1: Check MainWindowHandle on target & family processes
+                // Tier 1: Check MainWindowHandle directly on target & family processes
                 foreach (int pid in familyPids)
                 {
                     try
@@ -543,7 +558,7 @@ namespace AIProcessMonitor
         }
         #endregion
 
-        #region Process Scanning & Human Action Detection
+        #region Process Scanning & Accurate Human Action Detection
         public static string GetProcessesJson()
         {
             lock (cacheLock)
@@ -563,6 +578,7 @@ namespace AIProcessMonitor
                 var payload = new
                 {
                     status = "success",
+                    version = AppVersion,
                     timestamp = DateTime.UtcNow.ToString("o"),
                     scanDurationMs = sw.ElapsedMilliseconds,
                     count = list.Count,
@@ -607,8 +623,11 @@ namespace AIProcessMonitor
                 try { startTimeMap[p.Id] = p.StartTime; } catch { }
             }
 
+            // Detect active agent prompts and tool authorization pauses across all sessions in brain/
+            Dictionary<int, AgentPromptStatus> agentStatusMap;
+            DetectAgentPrompts(rawList, startTimeMap, out agentStatusMap);
+
             var aiResults = new List<ProcessInfo>();
-            bool isExplicitQuestionPending = CheckActiveAgentPromptWaiting();
 
             foreach (var rp in rawList)
             {
@@ -668,7 +687,7 @@ namespace AIProcessMonitor
                     double memMB = Math.Round(rp.WorkingSet / (1024.0 * 1024.0), 1);
 
                     string statusReason;
-                    bool needsInput = DetermineAccurateHumanAction(rp.Pid, pName, pCmd, isExplicitQuestionPending, out statusReason);
+                    bool needsInput = DetermineAccurateHumanAction(rp.Pid, pName, pCmd, agentStatusMap, out statusReason);
 
                     string cleanName = pName;
                     if (cleanName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
@@ -696,10 +715,181 @@ namespace AIProcessMonitor
                             .ToList();
         }
 
-        private static bool DetermineAccurateHumanAction(int pid, string name, string cmd, bool isExplicitQuestionPending, out string statusReason)
+        private static void DetectAgentPrompts(List<RawProc> rawList, Dictionary<int, DateTime> startTimeMap, out Dictionary<int, AgentPromptStatus> pidStatusMap)
+        {
+            pidStatusMap = new Dictionary<int, AgentPromptStatus>();
+
+            try
+            {
+                string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                string brainDir = Path.Combine(userProfile, ".gemini", "antigravity-cli", "brain");
+                if (!Directory.Exists(brainDir)) return;
+
+                var dirs = new DirectoryInfo(brainDir).GetDirectories();
+                var sessionInfos = new List<SessionInfo>();
+
+                foreach (var d in dirs)
+                {
+                    try
+                    {
+                        string transcriptPath = Path.Combine(d.FullName, ".system_generated", "logs", "transcript.jsonl");
+                        if (!File.Exists(transcriptPath)) continue;
+
+                        var fi = new FileInfo(transcriptPath);
+                        // Only consider sessions modified in the last 24 hours
+                        if ((DateTime.UtcNow - fi.LastWriteTimeUtc).TotalHours > 24) continue;
+
+                        string lastLine = null;
+                        using (var fs = new FileStream(transcriptPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                        using (var reader = new StreamReader(fs, Encoding.UTF8))
+                        {
+                            string line;
+                            while ((line = reader.ReadLine()) != null)
+                            {
+                                if (!string.IsNullOrWhiteSpace(line)) lastLine = line;
+                            }
+                        }
+
+                        if (lastLine != null)
+                        {
+                            sessionInfos.Add(new SessionInfo
+                            {
+                                DirName = d.Name,
+                                CreationTime = d.CreationTime,
+                                LastWriteTime = fi.LastWriteTime,
+                                LastLine = lastLine
+                            });
+                        }
+                    }
+                    catch { }
+                }
+
+                // Match each agy process to its closest session in brain/
+                var ser = new JavaScriptSerializer();
+                foreach (var rp in rawList)
+                {
+                    string pName = rp.Name ?? "";
+                    string pCmd = rp.CommandLine ?? "";
+
+                    if (pName.IndexOf("agy", StringComparison.OrdinalIgnoreCase) < 0 &&
+                        pCmd.IndexOf("agy.exe", StringComparison.OrdinalIgnoreCase) < 0)
+                    {
+                        continue;
+                    }
+
+                    DateTime procStart = DateTime.Now;
+                    if (startTimeMap.ContainsKey(rp.Pid)) procStart = startTimeMap[rp.Pid];
+
+                    // Find session with creation time closest to procStart (within 10 minutes)
+                    SessionInfo bestMatch = null;
+                    double bestDiff = double.MaxValue;
+
+                    foreach (var s in sessionInfos)
+                    {
+                        double diff = Math.Abs((s.CreationTime - procStart).TotalMinutes);
+                        if (diff < 10 && diff < bestDiff)
+                        {
+                            bestDiff = diff;
+                            bestMatch = s;
+                        }
+                    }
+
+                    // Fallback: if no match within 10 min, pick the most recently active session
+                    if (bestMatch == null && sessionInfos.Count > 0)
+                    {
+                        bestMatch = sessionInfos.OrderByDescending(s => s.LastWriteTime).FirstOrDefault();
+                    }
+
+                    if (bestMatch != null && bestMatch.LastLine != null)
+                    {
+                        try
+                        {
+                            var dict = ser.Deserialize<Dictionary<string, object>>(bestMatch.LastLine);
+                            string type = dict.ContainsKey("type") ? dict["type"].ToString() : "";
+                            bool hasToolCalls = dict.ContainsKey("tool_calls") && dict["tool_calls"] is System.Collections.ArrayList;
+
+                            // Condition 1: Tool call waiting for human authorization or response
+                            if (type == "PLANNER_RESPONSE" && hasToolCalls)
+                            {
+                                var toolCalls = (System.Collections.ArrayList)dict["tool_calls"];
+                                if (toolCalls.Count > 0)
+                                {
+                                    var firstTool = toolCalls[0] as Dictionary<string, object>;
+                                    string toolName = firstTool != null && firstTool.ContainsKey("name") ? firstTool["name"].ToString() : "ferramenta";
+                                    string toolSummary = "";
+
+                                    if (firstTool != null && firstTool.ContainsKey("args") && firstTool["args"] is Dictionary<string, object>)
+                                    {
+                                        var args = (Dictionary<string, object>)firstTool["args"];
+                                        if (args.ContainsKey("toolSummary")) toolSummary = args["toolSummary"].ToString().Trim('\"', ' ');
+                                        else if (args.ContainsKey("toolAction")) toolSummary = args["toolAction"].ToString().Trim('\"', ' ');
+                                    }
+
+                                    string reason;
+                                    if (toolName == "ask_question")
+                                    {
+                                        reason = "Pergunta aguardando resposta humana";
+                                    }
+                                    else if (!string.IsNullOrEmpty(toolSummary))
+                                    {
+                                        reason = "Aguardando autorização: " + toolSummary;
+                                    }
+                                    else if (toolName == "run_command")
+                                    {
+                                        reason = "Aguardando autorização para executar comando";
+                                    }
+                                    else if (toolName == "write_to_file" || toolName == "replace_file_content")
+                                    {
+                                        reason = "Aguardando confirmação para editar arquivo";
+                                    }
+                                    else
+                                    {
+                                        reason = "Aguardando autorização de ferramenta (" + toolName + ")";
+                                    }
+
+                                    pidStatusMap[rp.Pid] = new AgentPromptStatus
+                                    {
+                                        NeedsHumanInput = true,
+                                        Reason = reason
+                                    };
+                                }
+                            }
+                            else if (type == "PLANNER_RESPONSE")
+                            {
+                                pidStatusMap[rp.Pid] = new AgentPromptStatus
+                                {
+                                    NeedsHumanInput = false,
+                                    Reason = "Terminal pronto (aguardando comando)"
+                                };
+                            }
+                            else if (type == "USER_INPUT" || type == "GENERIC" || type == "SYSTEM_MESSAGE")
+                            {
+                                pidStatusMap[rp.Pid] = new AgentPromptStatus
+                                {
+                                    NeedsHumanInput = false,
+                                    Reason = "Executando tarefas..."
+                                };
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private static bool DetermineAccurateHumanAction(int pid, string name, string cmd, Dictionary<int, AgentPromptStatus> agentStatusMap, out string statusReason)
         {
             statusReason = "Em execução";
 
+            // 1. Authoritative check from agent transcript session
+            if (agentStatusMap != null && agentStatusMap.ContainsKey(pid))
+            {
+                statusReason = agentStatusMap[pid].Reason;
+                return agentStatusMap[pid].NeedsHumanInput;
+            }
+
+            // 2. Check modal dialogs and window titles for GUI & terminal windows
             try
             {
                 var proc = Process.GetProcessById(pid);
@@ -721,6 +911,7 @@ namespace AIProcessMonitor
 
                     if (title.Contains("confirm") || title.Contains("autoriz") ||
                         title.Contains("aguardando") || title.Contains("permissão") ||
+                        title.Contains("pause") || title.Contains("pausado") ||
                         title.Contains("input required") || title.Contains("y/n"))
                     {
                         statusReason = "Aguardando confirmação na janela";
@@ -730,12 +921,7 @@ namespace AIProcessMonitor
             }
             catch { }
 
-            if (isExplicitQuestionPending && name.IndexOf("agy", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                statusReason = "Pergunta ou confirmação aguardando resposta humana";
-                return true;
-            }
-
+            // 3. Normal process statuses
             if (cmd.IndexOf("server_webcam", StringComparison.OrdinalIgnoreCase) >= 0)
                 statusReason = "Servidor Web Ativo";
             else if (name.IndexOf("cloudcode", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -746,49 +932,6 @@ namespace AIProcessMonitor
                 statusReason = "Agente CLI Ativo";
             else
                 statusReason = "Em execução";
-
-            return false;
-        }
-
-        private static bool CheckActiveAgentPromptWaiting()
-        {
-            try
-            {
-                string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-                string brainDir = Path.Combine(userProfile, ".gemini", "antigravity-cli", "brain");
-                if (!Directory.Exists(brainDir)) return false;
-
-                var dirs = new DirectoryInfo(brainDir).GetDirectories()
-                    .OrderByDescending(d => d.LastWriteTime)
-                    .Take(2);
-
-                foreach (var d in dirs)
-                {
-                    string transcriptPath = Path.Combine(d.FullName, ".system_generated", "logs", "transcript.jsonl");
-                    if (File.Exists(transcriptPath))
-                    {
-                        using (var fs = new FileStream(transcriptPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                        using (var reader = new StreamReader(fs, Encoding.UTF8))
-                        {
-                            string lastLine = null;
-                            string line;
-                            while ((line = reader.ReadLine()) != null)
-                            {
-                                if (!string.IsNullOrWhiteSpace(line)) lastLine = line;
-                            }
-
-                            if (lastLine != null)
-                            {
-                                if (lastLine.Contains("\"ask_question\"") && !lastLine.Contains("\"type\":\"USER_INPUT\""))
-                                {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            catch { }
 
             return false;
         }
@@ -812,6 +955,20 @@ namespace AIProcessMonitor
             public string CommandLine { get; set; }
             public ulong WorkingSet { get; set; }
         }
+
+        private class SessionInfo
+        {
+            public string DirName { get; set; }
+            public DateTime CreationTime { get; set; }
+            public DateTime LastWriteTime { get; set; }
+            public string LastLine { get; set; }
+        }
+
+        private class AgentPromptStatus
+        {
+            public bool NeedsHumanInput { get; set; }
+            public string Reason { get; set; }
+        }
         #endregion
     }
 
@@ -827,6 +984,7 @@ namespace AIProcessMonitor
         // UI Controls
         private Panel headerPanel;
         private Label lblTitle;
+        private Label lblVersionBadge;
         private Label lblSubtitle;
         private Label lblCountValue;
         private Label lblMemValue;
@@ -837,6 +995,7 @@ namespace AIProcessMonitor
         private DataGridView dgv;
         private StatusStrip statusStrip;
         private ToolStripStatusLabel statusLabel;
+        private ToolStripStatusLabel versionStatusLabel;
         private ToolStripStatusLabel actionLabel;
         private ComboBox cmbInterval;
         private Button btnRefreshNow;
@@ -857,7 +1016,7 @@ namespace AIProcessMonitor
 
         private void InitializeComponent()
         {
-            this.Text = "⚡ AI Process Monitor • Painel Nativo";
+            this.Text = "⚡ AI Process Monitor v" + Program.AppVersion + " • Painel Nativo";
             this.Size = new Size(1180, 720);
             this.MinimumSize = new Size(950, 580);
             this.StartPosition = FormStartPosition.CenterScreen;
@@ -886,9 +1045,21 @@ namespace AIProcessMonitor
                 Location = new Point(20, 14)
             };
 
+            // Version Badge (Controle de Versão visual na tela)
+            lblVersionBadge = new Label
+            {
+                Text = "v" + Program.AppVersion,
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(56, 189, 248), // sky-400
+                BackColor = Color.FromArgb(15, 23, 42),   // slate-900
+                Padding = new Padding(6, 2, 6, 2),
+                AutoSize = true,
+                Location = new Point(275, 18)
+            };
+
             lblSubtitle = new Label
             {
-                Text = "Painel nativo em tempo real • Monitoramento de Processos de IA e Ação Humana",
+                Text = "Painel nativo em tempo real • Detecção de IA, Pausas de Terminal e Alertas de Ação Humana",
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
                 ForeColor = Color.FromArgb(148, 163, 184),
                 AutoSize = true,
@@ -900,7 +1071,7 @@ namespace AIProcessMonitor
             Panel cardMem = CreateMetricCard("MEMÓRIA RAM TOTAL", "0 MB", Color.FromArgb(192, 132, 252), 190, 68, out lblMemValue);
             Panel cardAlert = CreateMetricCard("ALERTAS DE AÇÃO", "0", Color.FromArgb(34, 197, 94), 370, 68, out lblAlertValue);
 
-            // Right-aligned controls
+            // Right-aligned header controls
             btnOpenBrowser = new Button
             {
                 Text = "🌐 Abrir no Navegador",
@@ -964,6 +1135,7 @@ namespace AIProcessMonitor
             };
 
             headerPanel.Controls.Add(lblTitle);
+            headerPanel.Controls.Add(lblVersionBadge);
             headerPanel.Controls.Add(lblSubtitle);
             headerPanel.Controls.Add(cardProcs);
             headerPanel.Controls.Add(cardMem);
@@ -994,7 +1166,7 @@ namespace AIProcessMonitor
             lblAlertBanner = new Label
             {
                 Text = "🚨 ATENÇÃO: Um ou mais processos de IA estão aguardando sua intervenção humana!",
-                Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
+                Font = new Font("Segoe UI", 10f, FontStyle.Bold),
                 ForeColor = Color.White,
                 AutoSize = true,
                 Location = new Point(20, 14)
@@ -1178,32 +1350,45 @@ namespace AIProcessMonitor
 
             statusLabel = new ToolStripStatusLabel
             {
-                Text = "● Monitor Ativo | Servidor da API: http://localhost:" + apiPort,
+                Text = "● Monitor Ativo | API: http://localhost:" + apiPort,
                 ForeColor = Color.FromArgb(34, 197, 94),
                 Spring = false
             };
 
             actionLabel = new ToolStripStatusLabel
             {
-                Text = "Dica: Clique no botão '🎯 Abrir Janela' ou duplo-clique na linha para focar a janela da aplicação.",
+                Text = "Dica: Clique em '🎯 Abrir Janela' ou duplo-clique na linha para focar a aplicação.",
                 ForeColor = Color.FromArgb(148, 163, 184),
                 Spring = true,
                 TextAlign = ContentAlignment.MiddleRight
             };
 
-            statusStrip.Items.AddRange(new ToolStripItem[] { statusLabel, actionLabel });
+            versionStatusLabel = new ToolStripStatusLabel
+            {
+                Text = "v" + Program.AppVersion,
+                ForeColor = Color.FromArgb(56, 189, 248),
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+                Spring = false,
+                BorderSides = ToolStripStatusLabelBorderSides.Left,
+                BorderStyle = Border3DStyle.Etched
+            };
+
+            statusStrip.Items.AddRange(new ToolStripItem[] { statusLabel, actionLabel, versionStatusLabel });
 
             // 5. System Tray Icon
             try
             {
                 trayIcon = new NotifyIcon
                 {
-                    Text = "AI Process Monitor",
+                    Text = "AI Process Monitor v" + Program.AppVersion,
                     Icon = SystemIcons.Application,
                     Visible = true
                 };
 
                 var contextMenu = new ContextMenuStrip();
+                var headerItem = contextMenu.Items.Add("AI Process Monitor v" + Program.AppVersion);
+                headerItem.Enabled = false;
+                contextMenu.Items.Add("-");
                 contextMenu.Items.Add("Restaurar Painel", null, (s, e) =>
                 {
                     this.Show();
@@ -1340,7 +1525,7 @@ namespace AIProcessMonitor
                     try
                     {
                         trayIcon.ShowBalloonTip(3000, "AI Process Monitor • Alerta",
-                            firstAlert.friendlyName + " está aguardando sua resposta!", ToolTipIcon.Warning);
+                            firstAlert.friendlyName + ": " + firstAlert.statusReason, ToolTipIcon.Warning);
                     }
                     catch { }
                 }
