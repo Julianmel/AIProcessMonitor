@@ -31,6 +31,9 @@ namespace AIProcessMonitor
         private static extern IntPtr OpenDesktop(string lpszDesktop, uint dwFlags, bool fInherit, uint dwDesiredAccess);
 
         [DllImport("user32.dll")]
+        private static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
+
+        [DllImport("user32.dll")]
         private static extern bool CloseDesktop(IntPtr hDesktop);
 
         public delegate bool EnumDesktopWindowsProc(IntPtr hWnd, IntPtr lParam);
@@ -38,11 +41,22 @@ namespace AIProcessMonitor
         [DllImport("user32.dll")]
         public static extern bool EnumDesktopWindows(IntPtr hDesktop, EnumDesktopWindowsProc lpfn, IntPtr lParam);
 
+        public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern bool EnumWindows(EnumWindowsProc lpfn, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
+
         [DllImport("user32.dll")]
         private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
 
         [DllImport("user32.dll")]
         private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
 
         [DllImport("user32.dll")]
         private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
@@ -58,6 +72,12 @@ namespace AIProcessMonitor
 
         [DllImport("user32.dll")]
         private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("user32.dll")]
+        private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
 
         [DllImport("user32.dll")]
         private static extern bool IsWindowVisible(IntPtr hWnd);
@@ -341,7 +361,30 @@ namespace AIProcessMonitor
                     ShowWindow(hWnd, 5); // SW_SHOW
                 }
 
-                // ALT key bypass trick
+                // Strategy 1: SwitchToThisWindow forces taskbar switch across desktop boundaries
+                try { SwitchToThisWindow(hWnd, true); } catch { }
+
+                // Strategy 2: AttachThreadInput bypass to overcome Windows foreground locks
+                try
+                {
+                    IntPtr fgHwnd = GetForegroundWindow();
+                    if (fgHwnd != IntPtr.Zero && fgHwnd != hWnd)
+                    {
+                        uint unusedPid;
+                        uint fgThread = GetWindowThreadProcessId(fgHwnd, out unusedPid);
+                        uint curThread = GetCurrentThreadId();
+                        if (fgThread != 0 && fgThread != curThread)
+                        {
+                            AttachThreadInput(curThread, fgThread, true);
+                            BringWindowToTop(hWnd);
+                            SetForegroundWindow(hWnd);
+                            AttachThreadInput(curThread, fgThread, false);
+                        }
+                    }
+                }
+                catch { }
+
+                // Strategy 3: Virtual ALT key event bypass
                 keybd_event(0x12, 0, 0, UIntPtr.Zero);
                 keybd_event(0x12, 0, 2, UIntPtr.Zero);
 
@@ -385,7 +428,7 @@ namespace AIProcessMonitor
                             catch { }
                         }
 
-                        // Trace ancestors
+                        // Trace ancestors (e.g. agy -> powershell -> WindowsTerminal)
                         int curr = targetPid;
                         int depth = 0;
                         while (depth < 8 && parentMap.ContainsKey(curr))
@@ -404,19 +447,33 @@ namespace AIProcessMonitor
                 }
                 catch { }
 
-                // Open the interactive "Default" desktop where user windows reside
-                IntPtr hDesk = OpenDesktop("Default", 0, false, DESKTOP_ALL);
-                if (hDesk == IntPtr.Zero)
-                {
-                    // Fallback to null (current desktop)
-                    hDesk = IntPtr.Zero;
-                }
-
                 IntPtr foundHwnd = IntPtr.Zero;
                 string foundTitle = "";
 
-                // Search windows on the Default desktop matching any PID in family
-                EnumDesktopWindows(hDesk, (hWnd, lParam) =>
+                // Tier 1: Check MainWindowHandle directly on target & family processes
+                foreach (int pid in familyPids)
+                {
+                    try
+                    {
+                        var proc = Process.GetProcessById(pid);
+                        if (proc.MainWindowHandle != IntPtr.Zero && IsWindowVisible(proc.MainWindowHandle))
+                        {
+                            var sb = new StringBuilder(512);
+                            GetWindowText(proc.MainWindowHandle, sb, 512);
+                            string title = sb.ToString().Trim();
+                            if (!string.IsNullOrEmpty(title))
+                            {
+                                foundHwnd = proc.MainWindowHandle;
+                                foundTitle = title;
+                                break;
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                // Helper window callback
+                EnumDesktopWindowsProc matchPidCallback = (hWnd, lParam) =>
                 {
                     uint winPid;
                     GetWindowThreadProcessId(hWnd, out winPid);
@@ -431,7 +488,7 @@ namespace AIProcessMonitor
                         {
                             foundHwnd = hWnd;
                             foundTitle = title;
-                            return false; // Stop at first good titled window
+                            return false;
                         }
                         else if (foundHwnd == IntPtr.Zero)
                         {
@@ -439,9 +496,28 @@ namespace AIProcessMonitor
                         }
                     }
                     return true;
-                }, IntPtr.Zero);
+                };
 
-                // Fallback: search by application name if PID tree didn't hit
+                // Tier 2: Open Desktop (Default or Input Desktop)
+                if (foundHwnd == IntPtr.Zero)
+                {
+                    IntPtr hDesk = OpenDesktop("Default", 0, false, DESKTOP_ALL);
+                    if (hDesk == IntPtr.Zero) hDesk = OpenInputDesktop(0, false, DESKTOP_ALL);
+
+                    if (hDesk != IntPtr.Zero)
+                    {
+                        EnumDesktopWindows(hDesk, matchPidCallback, IntPtr.Zero);
+                        CloseDesktop(hDesk);
+                    }
+                }
+
+                // Tier 3: Standard EnumWindows fallback
+                if (foundHwnd == IntPtr.Zero)
+                {
+                    EnumWindows((hWnd, lParam) => matchPidCallback(hWnd, lParam), IntPtr.Zero);
+                }
+
+                // Tier 4: Fallback search by friendly application keywords
                 if (foundHwnd == IntPtr.Zero)
                 {
                     string fallbackKeyword = "";
@@ -451,7 +527,7 @@ namespace AIProcessMonitor
 
                     if (!string.IsNullOrEmpty(fallbackKeyword))
                     {
-                        EnumDesktopWindows(hDesk, (hWnd, lParam) =>
+                        EnumDesktopWindowsProc matchTitleCallback = (hWnd, lParam) =>
                         {
                             var sb = new StringBuilder(512);
                             GetWindowText(hWnd, sb, 512);
@@ -463,13 +539,21 @@ namespace AIProcessMonitor
                                 return false;
                             }
                             return true;
-                        }, IntPtr.Zero);
-                    }
-                }
+                        };
 
-                if (hDesk != IntPtr.Zero)
-                {
-                    CloseDesktop(hDesk);
+                        IntPtr hDesk = OpenDesktop("Default", 0, false, DESKTOP_ALL);
+                        if (hDesk == IntPtr.Zero) hDesk = OpenInputDesktop(0, false, DESKTOP_ALL);
+                        if (hDesk != IntPtr.Zero)
+                        {
+                            EnumDesktopWindows(hDesk, matchTitleCallback, IntPtr.Zero);
+                            CloseDesktop(hDesk);
+                        }
+
+                        if (foundHwnd == IntPtr.Zero)
+                        {
+                            EnumWindows((hWnd, lParam) => matchTitleCallback(hWnd, lParam), IntPtr.Zero);
+                        }
+                    }
                 }
 
                 if (foundHwnd != IntPtr.Zero)
