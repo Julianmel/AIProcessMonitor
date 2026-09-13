@@ -725,11 +725,17 @@
       <div class="brand">
         <div class="brand-icon">⚡</div>
         <div>
-          <h1>AI Process Monitor <span style="font-size: 0.75rem; background: #334155; color: #38bdf8; padding: 2px 8px; border-radius: 9999px; margin-left: 6px; vertical-align: middle;">v1.4.0</span></h1>
+          <h1>AI Process Monitor <span style="font-size: 0.75rem; background: #334155; color: #38bdf8; padding: 2px 8px; border-radius: 9999px; margin-left: 6px; vertical-align: middle;">v1.5.0</span></h1>
           <p>Painel em tempo real • Clique no processo para ver detalhes e na tela de detalhes para focar</p>
         </div>
       </div>
       <div class="header-actions">
+        <a href="/api/export?format=json" download class="btn btn-secondary" title="Exportar processos em JSON">
+          📄 JSON
+        </a>
+        <a href="/api/export?format=csv" download class="btn btn-secondary" title="Exportar processos em CSV">
+          📊 CSV
+        </a>
         <button class="btn btn-secondary" onclick="testSoundAlert()" title="Testar som de notificação">
           🔔 Testar Som
         </button>
@@ -896,7 +902,7 @@
 
     <!-- Footer -->
     <footer>
-      <span>AI Process Monitor v1.4.0 • Dica: Clique em qualquer processo para abrir a subjanela de detalhes</span>
+      <span>AI Process Monitor v1.5.0 • Dica: Clique em qualquer processo para abrir a subjanela de detalhes</span>
       <span id="lastUpdatedLabel">Última checagem: --</span>
     </footer>
   </div>

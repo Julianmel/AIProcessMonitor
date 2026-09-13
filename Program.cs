@@ -14,15 +14,16 @@ using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 [assembly: AssemblyTitle("AI Process Monitor")]
 [assembly: AssemblyDescription("Monitor de Processos de IA e Ação Humana em Tempo Real")]
 [assembly: AssemblyCompany("Julianmel")]
 [assembly: AssemblyProduct("AI Process Monitor")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("1.4.0.0")]
-[assembly: AssemblyFileVersion("1.4.0.0")]
-[assembly: AssemblyInformationalVersion("1.4.0")]
+[assembly: AssemblyVersion("1.5.0.0")]
+[assembly: AssemblyFileVersion("1.5.0.0")]
+[assembly: AssemblyInformationalVersion("1.5.0")]
 
 namespace AIProcessMonitor
 {
@@ -153,9 +154,52 @@ namespace AIProcessMonitor
     }
     #endregion
 
+    #region Windows Startup & System Integration
+    public static class StartupManager
+    {
+        private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const string AppName = "AIProcessMonitor";
+
+        public static bool IsStartupEnabled()
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(RunKey, false))
+                {
+                    if (key == null) return false;
+                    var val = key.GetValue(AppName) as string;
+                    return !string.IsNullOrEmpty(val);
+                }
+            }
+            catch { return false; }
+        }
+
+        public static bool SetStartup(bool enable)
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(RunKey, true))
+                {
+                    if (key == null) return false;
+                    if (enable)
+                    {
+                        key.SetValue(AppName, "\"" + Application.ExecutablePath + "\"");
+                    }
+                    else
+                    {
+                        key.DeleteValue(AppName, false);
+                    }
+                    return true;
+                }
+            }
+            catch { return false; }
+        }
+    }
+    #endregion
+
     public static class Program
     {
-        public const string AppVersion = "1.4.0";
+        public const string AppVersion = "1.5.0";
         public const string BuildDate = "2026-09-13";
 
         public static int port = 3333;
@@ -503,6 +547,58 @@ namespace AIProcessMonitor
                     res.OutputStream.Write(buf, 0, buf.Length);
                     res.Close();
                     return;
+                }
+
+                if (path == "/api/export")
+                {
+                    string fmt = req.QueryString["format"] ?? "json";
+                    var list = ScanProcesses();
+                    if (fmt.ToLowerInvariant() == "csv")
+                    {
+                        var sb = new StringBuilder();
+                        sb.AppendLine("PID,FriendlyName,ProcessName,Category,CpuPercent,MemoryMB,NeedsHumanInput,StatusReason,WindowTitle,Uptime");
+                        foreach (var p in list)
+                        {
+                            sb.AppendLine(string.Format("\"{0}\",\"{1}\",\"{2}\",\"{3}\",\"{4:0.0}\",\"{5:0.0}\",\"{6}\",\"{7}\",\"{8}\",\"{9}\"",
+                                p.pid,
+                                (p.friendlyName ?? "").Replace("\"", "\"\""),
+                                (p.processName ?? "").Replace("\"", "\"\""),
+                                (p.category ?? "").Replace("\"", "\"\""),
+                                p.cpuPercent,
+                                p.memoryMB,
+                                p.needsHumanInput,
+                                (p.statusReason ?? "").Replace("\"", "\"\""),
+                                (p.windowTitle ?? "").Replace("\"", "\"\""),
+                                (p.uptimeHuman ?? "").Replace("\"", "\"\"")
+                            ));
+                        }
+                        byte[] buf = Encoding.UTF8.GetBytes(sb.ToString());
+                        res.ContentType = "text/csv; charset=utf-8";
+                        res.AddHeader("Content-Disposition", "attachment; filename=\"ai_processes_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".csv\"");
+                        res.ContentLength64 = buf.Length;
+                        res.OutputStream.Write(buf, 0, buf.Length);
+                        res.Close();
+                        return;
+                    }
+                    else
+                    {
+                        var ser = new JavaScriptSerializer();
+                        ser.MaxJsonLength = int.MaxValue;
+                        string json = ser.Serialize(new
+                        {
+                            version = AppVersion,
+                            exportedAt = DateTime.UtcNow.ToString("o"),
+                            count = list.Count,
+                            processes = list
+                        });
+                        byte[] buf = Encoding.UTF8.GetBytes(json);
+                        res.ContentType = "application/json; charset=utf-8";
+                        res.AddHeader("Content-Disposition", "attachment; filename=\"ai_processes_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".json\"");
+                        res.ContentLength64 = buf.Length;
+                        res.OutputStream.Write(buf, 0, buf.Length);
+                        res.Close();
+                        return;
+                    }
                 }
 
                 if (path == "/api/health")
@@ -1303,6 +1399,16 @@ namespace AIProcessMonitor
         // Header Sound Toggle Button (Modo Não Perturbe)
         private Button btnSoundToggle;
 
+        // Search, Filter & Export Controls (Fase 2)
+        private TextBox txtSearch;
+        private ComboBox cmbStatusFilter;
+        private Button btnExport;
+        private bool minimizeToTrayOnClose = true;
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern Int32 SendMessage(IntPtr hWnd, int msg, IntPtr wParam, [MarshalAs(UnmanagedType.LPWStr)] string lParam);
+        private const int EM_SETCUEBANNER = 0x1501;
+
         // Status & System Controls
         private StatusStrip statusStrip;
         private ToolStripStatusLabel statusLabel;
@@ -1458,6 +1564,60 @@ namespace AIProcessMonitor
                 refreshTimer.Interval = ms;
             };
 
+            // Search Input (Fase 2)
+            txtSearch = new TextBox
+            {
+                Size = new Size(200, 26),
+                BackColor = Color.FromArgb(15, 23, 42),
+                ForeColor = Color.White,
+                BorderStyle = BorderStyle.FixedSingle,
+                Font = new Font("Segoe UI", 9.2f)
+            };
+            txtSearch.TextChanged += (s, e) => RenderFilteredGrid();
+            txtSearch.KeyDown += (s, e) =>
+            {
+                if (e.KeyCode == Keys.Escape)
+                {
+                    txtSearch.Text = "";
+                    e.SuppressKeyPress = true;
+                }
+            };
+
+            // Status & Category Filter ComboBox (Fase 2)
+            cmbStatusFilter = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                Size = new Size(165, 26),
+                BackColor = Color.FromArgb(15, 23, 42),
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font("Segoe UI", 8.8f)
+            };
+            cmbStatusFilter.Items.AddRange(new object[] {
+                "🌐 Todos os Processos",
+                "🔴 Requer Atenção (Alerta)",
+                "🟢 Apenas Ativos",
+                "🤖 Agentes CLI",
+                "💻 Assistentes IDE",
+                "🧠 LLMs Locais"
+            });
+            cmbStatusFilter.SelectedIndex = 0;
+            cmbStatusFilter.SelectedIndexChanged += (s, e) => RenderFilteredGrid();
+
+            // Export Button (Fase 2)
+            btnExport = new Button
+            {
+                Text = "📥 Exportar ▼",
+                Size = new Size(115, 30),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 8.8f, FontStyle.Bold)
+            };
+            btnExport.FlatAppearance.BorderSize = 0;
+            btnExport.Click += (s, e) => ShowExportMenu();
+
             headerPanel.Controls.Add(lblTitle);
             headerPanel.Controls.Add(lblVersionBadge);
             headerPanel.Controls.Add(lblSubtitle);
@@ -1469,15 +1629,35 @@ namespace AIProcessMonitor
             headerPanel.Controls.Add(btnRefreshNow);
             headerPanel.Controls.Add(btnOpenBrowser);
             headerPanel.Controls.Add(btnSoundToggle);
+            headerPanel.Controls.Add(txtSearch);
+            headerPanel.Controls.Add(cmbStatusFilter);
+            headerPanel.Controls.Add(btnExport);
 
-            headerPanel.Resize += (s, e) =>
+            Action layoutControls = () =>
             {
                 btnSoundToggle.Location = new Point(headerPanel.Width - 180, 14);
                 btnOpenBrowser.Location = new Point(headerPanel.Width - 305, 14);
                 btnRefreshNow.Location = new Point(headerPanel.Width - 410, 14);
                 cmbInterval.Location = new Point(headerPanel.Width - 515, 18);
                 lblInterval.Location = new Point(headerPanel.Width - 560, 22);
+
+                int exportX = headerPanel.Width - 135;
+                int filterX = exportX - 175;
+                int searchX = filterX - 210;
+                if (searchX < 545) searchX = 545;
+                btnExport.Location = new Point(exportX, 68);
+                cmbStatusFilter.Location = new Point(filterX, 69);
+                txtSearch.Location = new Point(searchX, 69);
             };
+
+            layoutControls();
+            headerPanel.Resize += (s, e) => layoutControls();
+
+            try
+            {
+                SendMessage(txtSearch.Handle, EM_SETCUEBANNER, (IntPtr)1, "🔍 Buscar por nome, PID...");
+            }
+            catch { }
 
             // 2. Alert Banner Panel
             alertBanner = new Panel
@@ -1694,8 +1874,42 @@ namespace AIProcessMonitor
                 muteMenu.DropDownItems.Add("🔇 Silenciar Indefinidamente", null, (s, e) => UpdateMuteMode("indefinite"));
                 contextMenu.Items.Add(muteMenu);
 
+                var exportMenu = new ToolStripMenuItem("📥 Exportar Relatório");
+                exportMenu.DropDownItems.Add("📄 Salvar como JSON (.json)", null, (s, e) => ExportProcesses("json"));
+                exportMenu.DropDownItems.Add("📊 Salvar como CSV (.csv)", null, (s, e) => ExportProcesses("csv"));
+                exportMenu.DropDownItems.Add("📋 Copiar Resumo para Área de Transferência", null, (s, e) => ExportProcesses("clipboard"));
+                contextMenu.Items.Add(exportMenu);
+
                 contextMenu.Items.Add("-");
-                contextMenu.Items.Add("Sair", null, (s, e) => Application.Exit());
+
+                var startupItem = new ToolStripMenuItem("⚙️ Iniciar com o Windows");
+                startupItem.CheckOnClick = true;
+                startupItem.Checked = StartupManager.IsStartupEnabled();
+                startupItem.Click += (s, e) =>
+                {
+                    StartupManager.SetStartup(startupItem.Checked);
+                    actionLabel.Text = startupItem.Checked ? "✅ Inicialização com o Windows ATIVADA" : "ℹ️ Inicialização com o Windows DESATIVADA";
+                    actionLabel.ForeColor = Color.FromArgb(34, 197, 94);
+                };
+                contextMenu.Items.Add(startupItem);
+
+                var minTrayItem = new ToolStripMenuItem("⚙️ Minimizar para a Bandeja ao Fechar");
+                minTrayItem.CheckOnClick = true;
+                minTrayItem.Checked = minimizeToTrayOnClose;
+                minTrayItem.Click += (s, e) =>
+                {
+                    minimizeToTrayOnClose = minTrayItem.Checked;
+                    actionLabel.Text = minimizeToTrayOnClose ? "✅ Minimizar para a bandeja ao fechar ATIVADO" : "ℹ️ Fechar aplicação ao sair ATIVADO";
+                    actionLabel.ForeColor = Color.FromArgb(34, 197, 94);
+                };
+                contextMenu.Items.Add(minTrayItem);
+
+                contextMenu.Items.Add("-");
+                contextMenu.Items.Add("Sair", null, (s, e) =>
+                {
+                    minimizeToTrayOnClose = false;
+                    Application.Exit();
+                });
 
                 trayIcon.ContextMenuStrip = contextMenu;
                 trayIcon.DoubleClick += (s, e) =>
@@ -1926,6 +2140,38 @@ namespace AIProcessMonitor
                 }
             }
 
+            RenderFilteredGrid();
+        }
+
+        private void RenderFilteredGrid()
+        {
+            if (currentProcesses == null) return;
+
+            string query = (txtSearch != null ? txtSearch.Text : "").Trim().ToLowerInvariant();
+            int filterIdx = (cmbStatusFilter != null ? cmbStatusFilter.SelectedIndex : 0);
+
+            var filtered = currentProcesses.Where(p =>
+            {
+                if (filterIdx == 1 && !p.needsHumanInput) return false;
+                if (filterIdx == 2 && p.needsHumanInput) return false;
+                if (filterIdx == 3 && (p.category == null || p.category.IndexOf("CLI", StringComparison.OrdinalIgnoreCase) < 0)) return false;
+                if (filterIdx == 4 && (p.category == null || p.category.IndexOf("IDE", StringComparison.OrdinalIgnoreCase) < 0)) return false;
+                if (filterIdx == 5 && (p.category == null || (p.category.IndexOf("LLM", StringComparison.OrdinalIgnoreCase) < 0 && p.category.IndexOf("Ollama", StringComparison.OrdinalIgnoreCase) < 0))) return false;
+
+                if (!string.IsNullOrEmpty(query))
+                {
+                    bool match = (p.friendlyName != null && p.friendlyName.ToLowerInvariant().Contains(query))
+                              || (p.processName != null && p.processName.ToLowerInvariant().Contains(query))
+                              || p.pid.ToString().Contains(query)
+                              || (p.category != null && p.category.ToLowerInvariant().Contains(query))
+                              || (p.statusReason != null && p.statusReason.ToLowerInvariant().Contains(query))
+                              || (p.windowTitle != null && p.windowTitle.ToLowerInvariant().Contains(query));
+                    if (!match) return false;
+                }
+
+                return true;
+            }).ToList();
+
             int selectedPid = -1;
             if (dgv.SelectedRows.Count > 0)
             {
@@ -1933,9 +2179,9 @@ namespace AIProcessMonitor
             }
 
             dgv.Rows.Clear();
-            for (int i = 0; i < list.Count; i++)
+            for (int i = 0; i < filtered.Count; i++)
             {
-                var p = list[i];
+                var p = filtered[i];
                 string statusDisplay = p.needsHumanInput ? "🔴 AÇÃO HUMANA" : "🟢 Ativo";
                 string nameDisplay = p.friendlyName + " (" + p.processName + ")";
 
@@ -1953,6 +2199,146 @@ namespace AIProcessMonitor
                 if (p.pid == selectedPid)
                 {
                     dgv.Rows[rowIndex].Selected = true;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(query) || filterIdx > 0)
+            {
+                statusLabel.Text = string.Format("● Filtrados: {0} de {1} processos | API: http://localhost:{2}", filtered.Count, currentProcesses.Count, apiPort);
+            }
+            else
+            {
+                statusLabel.Text = string.Format("● Monitor Ativo ({0} processos) | API: http://localhost:{1}", currentProcesses.Count, apiPort);
+            }
+        }
+
+        private void ShowExportMenu()
+        {
+            var menu = new ContextMenuStrip();
+            menu.Items.Add("📄 Salvar Relatório em JSON (.json)", null, (s, e) => ExportProcesses("json"));
+            menu.Items.Add("📊 Salvar Relatório em CSV (.csv)", null, (s, e) => ExportProcesses("csv"));
+            menu.Items.Add("📋 Copiar Resumo para Área de Transferência", null, (s, e) => ExportProcesses("clipboard"));
+            menu.Items.Add("-");
+
+            var startupItem = new ToolStripMenuItem("⚙️ Iniciar com o Windows");
+            startupItem.CheckOnClick = true;
+            startupItem.Checked = StartupManager.IsStartupEnabled();
+            startupItem.Click += (s, e) =>
+            {
+                StartupManager.SetStartup(startupItem.Checked);
+                actionLabel.Text = startupItem.Checked ? "✅ Inicialização com o Windows ATIVADA" : "ℹ️ Inicialização com o Windows DESATIVADA";
+                actionLabel.ForeColor = Color.FromArgb(34, 197, 94);
+            };
+            menu.Items.Add(startupItem);
+
+            var minTrayItem = new ToolStripMenuItem("⚙️ Minimizar para a Bandeja ao Fechar");
+            minTrayItem.CheckOnClick = true;
+            minTrayItem.Checked = minimizeToTrayOnClose;
+            minTrayItem.Click += (s, e) =>
+            {
+                minimizeToTrayOnClose = minTrayItem.Checked;
+                actionLabel.Text = minimizeToTrayOnClose ? "✅ Minimizar para a bandeja ao fechar ATIVADO" : "ℹ️ Fechar aplicação ao sair ATIVADO";
+                actionLabel.ForeColor = Color.FromArgb(34, 197, 94);
+            };
+            menu.Items.Add(minTrayItem);
+
+            menu.Show(btnExport, new Point(0, btnExport.Height + 2));
+        }
+
+        private void ExportProcesses(string format)
+        {
+            if (currentProcesses == null || currentProcesses.Count == 0)
+            {
+                MessageBox.Show(this, "Nenhum processo monitorado para exportar no momento.", "AI Process Monitor", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (format == "clipboard")
+            {
+                var sb = new StringBuilder();
+                sb.AppendLine("=== AI Process Monitor - Relatório de Processos de IA ===");
+                sb.AppendLine("Data: " + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
+                sb.AppendLine("Total de Processos: " + currentProcesses.Count);
+                sb.AppendLine(new string('-', 70));
+                foreach (var p in currentProcesses)
+                {
+                    sb.AppendLine(string.Format("[{0}] {1} (PID {2}) | CPU: {3:0.0}% | RAM: {4:0.0}MB | Status: {5} ({6})",
+                        p.category, p.friendlyName, p.pid, p.cpuPercent, p.memoryMB,
+                        (p.needsHumanInput ? "AÇÃO HUMANA" : "Ativo"), p.statusReason));
+                }
+                try
+                {
+                    Clipboard.SetText(sb.ToString());
+                    actionLabel.Text = "📋 Resumo copiado para a Área de Transferência com sucesso!";
+                    actionLabel.ForeColor = Color.FromArgb(34, 197, 94);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(this, "Erro ao copiar para a área de transferência: " + ex.Message, "Erro", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                return;
+            }
+
+            using (var sfd = new SaveFileDialog())
+            {
+                string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
+                if (format == "csv")
+                {
+                    sfd.Filter = "Arquivo CSV (*.csv)|*.csv|Todos os Arquivos (*.*)|*.*";
+                    sfd.FileName = "ai_processes_" + timestamp + ".csv";
+                }
+                else
+                {
+                    sfd.Filter = "Arquivo JSON (*.json)|*.json|Todos os Arquivos (*.*)|*.*";
+                    sfd.FileName = "ai_processes_" + timestamp + ".json";
+                }
+
+                if (sfd.ShowDialog(this) == DialogResult.OK)
+                {
+                    try
+                    {
+                        if (format == "csv")
+                        {
+                            var sb = new StringBuilder();
+                            sb.AppendLine("PID,FriendlyName,ProcessName,Category,CpuPercent,MemoryMB,NeedsHumanInput,StatusReason,WindowTitle,Uptime");
+                            foreach (var p in currentProcesses)
+                            {
+                                sb.AppendLine(string.Format("\"{0}\",\"{1}\",\"{2}\",\"{3}\",\"{4:0.0}\",\"{5:0.0}\",\"{6}\",\"{7}\",\"{8}\",\"{9}\"",
+                                    p.pid,
+                                    (p.friendlyName ?? "").Replace("\"", "\"\""),
+                                    (p.processName ?? "").Replace("\"", "\"\""),
+                                    (p.category ?? "").Replace("\"", "\"\""),
+                                    p.cpuPercent,
+                                    p.memoryMB,
+                                    p.needsHumanInput,
+                                    (p.statusReason ?? "").Replace("\"", "\"\""),
+                                    (p.windowTitle ?? "").Replace("\"", "\"\""),
+                                    (p.uptimeHuman ?? "").Replace("\"", "\"\"")
+                                ));
+                            }
+                            File.WriteAllText(sfd.FileName, sb.ToString(), Encoding.UTF8);
+                        }
+                        else
+                        {
+                            var ser = new JavaScriptSerializer();
+                            ser.MaxJsonLength = int.MaxValue;
+                            string json = ser.Serialize(new
+                            {
+                                version = Program.AppVersion,
+                                exportedAt = DateTime.UtcNow.ToString("o"),
+                                count = currentProcesses.Count,
+                                processes = currentProcesses
+                            });
+                            File.WriteAllText(sfd.FileName, json, Encoding.UTF8);
+                        }
+
+                        actionLabel.Text = "💾 Relatório salvo em: " + Path.GetFileName(sfd.FileName);
+                        actionLabel.ForeColor = Color.FromArgb(34, 197, 94);
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show(this, "Erro ao salvar arquivo: " + ex.Message, "Erro ao Exportar", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
                 }
             }
         }
@@ -2002,6 +2388,22 @@ namespace AIProcessMonitor
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            if (minimizeToTrayOnClose && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                this.Hide();
+                if (trayIcon != null)
+                {
+                    try
+                    {
+                        trayIcon.ShowBalloonTip(2500, "AI Process Monitor",
+                            "O monitor continua em execução na bandeja do sistema.", ToolTipIcon.Info);
+                    }
+                    catch { }
+                }
+                return;
+            }
+
             if (refreshTimer != null) refreshTimer.Stop();
             if (audioAlertTimer != null) audioAlertTimer.Stop();
             if (trayIcon != null) trayIcon.Dispose();
