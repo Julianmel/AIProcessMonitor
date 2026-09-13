@@ -5,3 +5,7 @@
 .vscode/
 Thumbs.db
 Desktop.ini
+*.exe
+!AIProcessMonitor.exe
+*.apk
+

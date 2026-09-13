@@ -18,16 +18,16 @@ using System.Windows.Forms;
 [assembly: AssemblyCompany("Julianmel")]
 [assembly: AssemblyProduct("AI Process Monitor")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("1.2.1.0")]
-[assembly: AssemblyFileVersion("1.2.1.0")]
-[assembly: AssemblyInformationalVersion("1.2.1")]
+[assembly: AssemblyVersion("1.3.0.0")]
+[assembly: AssemblyFileVersion("1.3.0.0")]
+[assembly: AssemblyInformationalVersion("1.3.0")]
 
 namespace AIProcessMonitor
 {
     public static class Program
     {
-        public const string AppVersion = "1.2.1";
-        public const string BuildDate = "2026-09-09";
+        public const string AppVersion = "1.3.0";
+        public const string BuildDate = "2026-09-13";
 
         public static int port = 3333;
         private static HttpListener listener;
@@ -36,6 +36,18 @@ namespace AIProcessMonitor
         private static string cachedJson = null;
         private static List<ProcessInfo> cachedProcessList = new List<ProcessInfo>();
         private static DateTime lastScanTime = DateTime.MinValue;
+
+        #region CPU Tracker Storage
+        private class CpuTracker
+        {
+            public DateTime LastSampleUtc;
+            public TimeSpan LastProcessorTime;
+            public double LastCalculatedCpu;
+        }
+
+        private static readonly Dictionary<int, CpuTracker> cpuTrackers = new Dictionary<int, CpuTracker>();
+        private static readonly object cpuLock = new object();
+        #endregion
 
         #region Win32 API Imports for Desktop & Window Management
         private const uint GW_ENABLEDPOPUP = 6;
@@ -398,35 +410,41 @@ namespace AIProcessMonitor
 
                 try
                 {
-                    using (var searcher = new ManagementObjectSearcher("SELECT ProcessId, ParentProcessId FROM Win32_Process"))
+                    using (var searcher = new ManagementObjectSearcher(
+                        "SELECT ProcessId FROM Win32_Process WHERE ParentProcessId = " + targetPid))
                     {
-                        var parentMap = new Dictionary<int, int>();
-                        var childrenMap = new Dictionary<int, List<int>>();
+                        foreach (ManagementObject mo in searcher.Get())
+                        {
+                            try { familyPids.Add(Convert.ToInt32(mo["ProcessId"])); } catch { }
+                        }
+                    }
+                }
+                catch { }
+
+                try
+                {
+                    using (var searcher = new ManagementObjectSearcher(
+                        "SELECT ParentProcessId FROM Win32_Process WHERE ProcessId = " + targetPid))
+                    {
                         foreach (ManagementObject mo in searcher.Get())
                         {
                             try
                             {
-                                int id = Convert.ToInt32(mo["ProcessId"]);
-                                int par = Convert.ToInt32(mo["ParentProcessId"]);
-                                parentMap[id] = par;
-                                if (!childrenMap.ContainsKey(par)) childrenMap[par] = new List<int>();
-                                childrenMap[par].Add(id);
+                                int parentId = Convert.ToInt32(mo["ParentProcessId"]);
+                                if (parentId > 0)
+                                {
+                                    familyPids.Add(parentId);
+                                    using (var subSearcher = new ManagementObjectSearcher(
+                                        "SELECT ProcessId FROM Win32_Process WHERE ParentProcessId = " + parentId))
+                                    {
+                                        foreach (ManagementObject subMo in subSearcher.Get())
+                                        {
+                                            try { familyPids.Add(Convert.ToInt32(subMo["ProcessId"])); } catch { }
+                                        }
+                                    }
+                                }
                             }
                             catch { }
-                        }
-
-                        int curr = targetPid;
-                        int depth = 0;
-                        while (depth < 8 && parentMap.ContainsKey(curr))
-                        {
-                            curr = parentMap[curr];
-                            familyPids.Add(curr);
-                            depth++;
-                        }
-
-                        if (childrenMap.ContainsKey(targetPid))
-                        {
-                            foreach (int ch in childrenMap[targetPid]) familyPids.Add(ch);
                         }
                     }
                 }
@@ -435,59 +453,40 @@ namespace AIProcessMonitor
                 IntPtr foundHwnd = IntPtr.Zero;
                 string foundTitle = "";
 
-                // Tier 1: Check MainWindowHandle directly on target & family processes
-                foreach (int pid in familyPids)
+                // Tier 1: Process MainWindowHandle
+                if (p != null && p.MainWindowHandle != IntPtr.Zero)
                 {
-                    try
-                    {
-                        var proc = Process.GetProcessById(pid);
-                        if (proc.MainWindowHandle != IntPtr.Zero && IsWindowVisible(proc.MainWindowHandle))
-                        {
-                            var sb = new StringBuilder(512);
-                            GetWindowText(proc.MainWindowHandle, sb, 512);
-                            string title = sb.ToString().Trim();
-                            if (!string.IsNullOrEmpty(title))
-                            {
-                                foundHwnd = proc.MainWindowHandle;
-                                foundTitle = title;
-                                break;
-                            }
-                        }
-                    }
-                    catch { }
+                    foundHwnd = p.MainWindowHandle;
+                    foundTitle = p.MainWindowTitle;
                 }
 
-                EnumDesktopWindowsProc matchPidCallback = (hWnd, lParam) =>
-                {
-                    uint winPid;
-                    GetWindowThreadProcessId(hWnd, out winPid);
-
-                    if (familyPids.Contains((int)winPid))
-                    {
-                        var sb = new StringBuilder(512);
-                        GetWindowText(hWnd, sb, 512);
-                        string title = sb.ToString().Trim();
-
-                        if (!string.IsNullOrEmpty(title))
-                        {
-                            foundHwnd = hWnd;
-                            foundTitle = title;
-                            return false;
-                        }
-                        else if (foundHwnd == IntPtr.Zero)
-                        {
-                            foundHwnd = hWnd;
-                        }
-                    }
-                    return true;
-                };
-
-                // Tier 2: Open Desktop (Default or Input Desktop)
+                // Tier 2: Check active interactive desktops
                 if (foundHwnd == IntPtr.Zero)
                 {
+                    EnumDesktopWindowsProc matchPidCallback = (hWnd, lParam) =>
+                    {
+                        if (!IsWindowVisible(hWnd)) return true;
+
+                        uint wPid;
+                        GetWindowThreadProcessId(hWnd, out wPid);
+                        if (familyPids.Contains((int)wPid))
+                        {
+                            var sb = new StringBuilder(512);
+                            GetWindowText(hWnd, sb, 512);
+                            string title = sb.ToString().Trim();
+
+                            if (foundHwnd == IntPtr.Zero || !string.IsNullOrEmpty(title))
+                            {
+                                foundHwnd = hWnd;
+                                foundTitle = title;
+                                if (!string.IsNullOrEmpty(title)) return false;
+                            }
+                        }
+                        return true;
+                    };
+
                     IntPtr hDesk = OpenDesktop("Default", 0, false, DESKTOP_ALL);
                     if (hDesk == IntPtr.Zero) hDesk = OpenInputDesktop(0, false, DESKTOP_ALL);
-
                     if (hDesk != IntPtr.Zero)
                     {
                         EnumDesktopWindows(hDesk, matchPidCallback, IntPtr.Zero);
@@ -495,10 +494,32 @@ namespace AIProcessMonitor
                     }
                 }
 
-                // Tier 3: Standard EnumWindows fallback
+                // Tier 3: Global EnumWindows
                 if (foundHwnd == IntPtr.Zero)
                 {
-                    EnumWindows((hWnd, lParam) => matchPidCallback(hWnd, lParam), IntPtr.Zero);
+                    EnumWindowsProc matchPidCallback = (hWnd, lParam) =>
+                    {
+                        if (!IsWindowVisible(hWnd)) return true;
+
+                        uint wPid;
+                        GetWindowThreadProcessId(hWnd, out wPid);
+                        if (familyPids.Contains((int)wPid))
+                        {
+                            var sb = new StringBuilder(512);
+                            GetWindowText(hWnd, sb, 512);
+                            string title = sb.ToString().Trim();
+
+                            if (foundHwnd == IntPtr.Zero || !string.IsNullOrEmpty(title))
+                            {
+                                foundHwnd = hWnd;
+                                foundTitle = title;
+                                if (!string.IsNullOrEmpty(title)) return false;
+                            }
+                        }
+                        return true;
+                    };
+
+                    EnumWindows(matchPidCallback, IntPtr.Zero);
                 }
 
                 // Tier 4: Fallback search by friendly keywords
@@ -686,6 +707,87 @@ namespace AIProcessMonitor
                     double uptimeSec = Math.Max(0, (DateTime.Now - start).TotalSeconds);
                     double memMB = Math.Round(rp.WorkingSet / (1024.0 * 1024.0), 1);
 
+                    // Accurate CPU & process detail collection
+                    double cpuUsage = 0.0;
+                    string execPath = "";
+                    string winTitle = "";
+                    string priority = "Normal";
+                    int threadCount = 0;
+                    double peakMemMB = 0;
+
+                    try
+                    {
+                        using (var proc = Process.GetProcessById(rp.Pid))
+                        {
+                            DateTime nowUtc = DateTime.UtcNow;
+                            TimeSpan totalProcTime = proc.TotalProcessorTime;
+
+                            lock (cpuLock)
+                            {
+                                if (cpuTrackers.ContainsKey(rp.Pid))
+                                {
+                                    var tr = cpuTrackers[rp.Pid];
+                                    double elapsedSec = (nowUtc - tr.LastSampleUtc).TotalSeconds;
+                                    if (elapsedSec >= 0.25)
+                                    {
+                                        double procSec = (totalProcTime - tr.LastProcessorTime).TotalSeconds;
+                                        double percent = (procSec / (elapsedSec * Environment.ProcessorCount)) * 100.0;
+                                        if (percent < 0) percent = 0;
+                                        if (percent > 100) percent = 100;
+                                        cpuUsage = Math.Round(percent, 1);
+                                        tr.LastSampleUtc = nowUtc;
+                                        tr.LastProcessorTime = totalProcTime;
+                                        tr.LastCalculatedCpu = cpuUsage;
+                                    }
+                                    else
+                                    {
+                                        cpuUsage = tr.LastCalculatedCpu;
+                                    }
+                                }
+                                else
+                                {
+                                    cpuTrackers[rp.Pid] = new CpuTracker
+                                    {
+                                        LastSampleUtc = nowUtc,
+                                        LastProcessorTime = totalProcTime,
+                                        LastCalculatedCpu = 0.0
+                                    };
+                                    cpuUsage = 0.0;
+                                }
+                            }
+
+                            try { winTitle = proc.MainWindowTitle; } catch { }
+                            try { threadCount = proc.Threads.Count; } catch { }
+                            try { priority = proc.PriorityClass.ToString(); } catch { }
+                            try { peakMemMB = Math.Round(proc.PeakWorkingSet64 / (1024.0 * 1024.0), 1); } catch { }
+                            try { if (proc.MainModule != null) execPath = proc.MainModule.FileName; } catch { }
+                        }
+                    }
+                    catch
+                    {
+                        lock (cpuLock)
+                        {
+                            if (cpuTrackers.ContainsKey(rp.Pid))
+                                cpuUsage = cpuTrackers[rp.Pid].LastCalculatedCpu;
+                        }
+                    }
+
+                    if (string.IsNullOrEmpty(execPath) && !string.IsNullOrEmpty(pCmd))
+                    {
+                        string trimmed = pCmd.Trim();
+                        if (trimmed.StartsWith("\""))
+                        {
+                            int q = trimmed.IndexOf('\"', 1);
+                            if (q > 1) execPath = trimmed.Substring(1, q - 1);
+                        }
+                        else
+                        {
+                            int sp = trimmed.IndexOf(' ');
+                            if (sp > 0) execPath = trimmed.Substring(0, sp);
+                            else execPath = trimmed;
+                        }
+                    }
+
                     string statusReason;
                     bool needsInput = DetermineAccurateHumanAction(rp.Pid, pName, pCmd, agentStatusMap, out statusReason);
 
@@ -702,12 +804,26 @@ namespace AIProcessMonitor
                         startTime = start.ToString("yyyy-MM-dd HH:mm:ss"),
                         uptimeSeconds = Math.Round(uptimeSec),
                         uptimeHuman = FormatUptime(uptimeSec),
+                        cpuPercent = cpuUsage,
                         memoryMB = memMB,
                         commandLine = pCmd,
                         needsHumanInput = needsInput,
-                        statusReason = statusReason
+                        statusReason = statusReason,
+                        executablePath = execPath,
+                        windowTitle = winTitle,
+                        priority = priority,
+                        threadsCount = threadCount,
+                        peakMemoryMB = peakMemMB
                     });
                 }
+            }
+
+            // Purge dead trackers
+            lock (cpuLock)
+            {
+                var alivePids = new HashSet<int>(rawList.Select(r => r.Pid));
+                var dead = cpuTrackers.Keys.Where(k => !alivePids.Contains(k)).ToList();
+                foreach (var d in dead) cpuTrackers.Remove(d);
             }
 
             return aiResults.OrderByDescending(p => p.needsHumanInput)
@@ -972,16 +1088,18 @@ namespace AIProcessMonitor
         #endregion
     }
 
-    #region Native Windows Forms Desktop GUI (Requisito: Tela direta no EXE sem precisar de browser)
+    #region Native Windows Forms Desktop GUI
     public class MainForm : Form
     {
         private int apiPort;
         private System.Windows.Forms.Timer refreshTimer;
+        private System.Windows.Forms.Timer audioAlertTimer;
         private List<ProcessInfo> currentProcesses = new List<ProcessInfo>();
+        private int selectedPid = -1;
         private bool isScanning = false;
         private bool hadAlertBefore = false;
 
-        // UI Controls
+        // UI Header Controls
         private Panel headerPanel;
         private Label lblTitle;
         private Label lblVersionBadge;
@@ -993,6 +1111,20 @@ namespace AIProcessMonitor
         private Label lblAlertBanner;
         private Button btnAlertFocus;
         private DataGridView dgv;
+
+        // Details Panel Controls (Requisitos 3 & 4)
+        private Panel detailsPanel;
+        private Label lblDetailHeader;
+        private Label lblDetailSubtitle;
+        private Button btnDetailFocus;
+        private Panel cardDetail1;
+        private Panel cardDetail2;
+        private Panel cardDetail3;
+        private Label lblD1_Name, lblD1_Bin, lblD1_Cat, lblD1_Status, lblD1_Reason;
+        private Label lblD2_Cpu, lblD2_Mem, lblD2_Peak, lblD2_Threads, lblD2_Uptime;
+        private Label lblD3_WinTitle, lblD3_Path, lblD3_Cmd;
+
+        // Status & System Controls
         private StatusStrip statusStrip;
         private ToolStripStatusLabel statusLabel;
         private ToolStripStatusLabel versionStatusLabel;
@@ -1017,8 +1149,8 @@ namespace AIProcessMonitor
         private void InitializeComponent()
         {
             this.Text = "⚡ AI Process Monitor v" + Program.AppVersion + " • Painel Nativo";
-            this.Size = new Size(1180, 720);
-            this.MinimumSize = new Size(950, 580);
+            this.Size = new Size(1200, 750);
+            this.MinimumSize = new Size(1000, 620);
             this.StartPosition = FormStartPosition.CenterScreen;
             this.BackColor = Color.FromArgb(15, 23, 42); // slate-900
             this.ForeColor = Color.FromArgb(248, 250, 252);
@@ -1059,7 +1191,7 @@ namespace AIProcessMonitor
 
             lblSubtitle = new Label
             {
-                Text = "Painel nativo em tempo real • Dê um duplo-clique na linha para abrir a janela da aplicação",
+                Text = "Painel nativo em tempo real • Clique no processo para ver detalhes e na tela de detalhes para focar",
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
                 ForeColor = Color.FromArgb(148, 163, 184),
                 AutoSize = true,
@@ -1217,7 +1349,7 @@ namespace AIProcessMonitor
                 MultiSelect = false,
                 RowHeadersVisible = false,
                 EnableHeadersVisualStyles = false,
-                RowTemplate = { Height = 46 }
+                RowTemplate = { Height = 40 }
             };
 
             dgv.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(15, 23, 42);
@@ -1227,99 +1359,28 @@ namespace AIProcessMonitor
             dgv.ColumnHeadersHeight = 36;
             dgv.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
 
+            // Requisito 1: "Não precisa de faixa azul quando seleciono algum processo. Deixa sem nada."
             dgv.DefaultCellStyle.BackColor = Color.FromArgb(30, 41, 59);
             dgv.DefaultCellStyle.ForeColor = Color.FromArgb(248, 250, 252);
-            dgv.DefaultCellStyle.SelectionBackColor = Color.FromArgb(37, 99, 235);
-            dgv.DefaultCellStyle.SelectionForeColor = Color.White;
+            dgv.DefaultCellStyle.SelectionBackColor = Color.FromArgb(30, 41, 59);
+            dgv.DefaultCellStyle.SelectionForeColor = Color.FromArgb(248, 250, 252);
             dgv.DefaultCellStyle.Padding = new Padding(8, 0, 8, 0);
 
             dgv.AlternatingRowsDefaultCellStyle.BackColor = Color.FromArgb(24, 34, 50);
+            dgv.AlternatingRowsDefaultCellStyle.SelectionBackColor = Color.FromArgb(24, 34, 50);
+            dgv.AlternatingRowsDefaultCellStyle.SelectionForeColor = Color.FromArgb(248, 250, 252);
 
-            // Columns
-            var colStatus = new DataGridViewTextBoxColumn
+            // Evitar retângulo pontilhado de foco de célula
+            dgv.CellPainting += (s, e) =>
             {
-                Name = "colStatus",
-                HeaderText = "STATUS",
-                Width = 175
-            };
-
-            var colName = new DataGridViewTextBoxColumn
-            {
-                Name = "colName",
-                HeaderText = "APLICAÇÃO / IA",
-                Width = 240
-            };
-
-            var colCategory = new DataGridViewTextBoxColumn
-            {
-                Name = "colCategory",
-                HeaderText = "CATEGORIA",
-                Width = 170
-            };
-
-            var colPid = new DataGridViewTextBoxColumn
-            {
-                Name = "colPid",
-                HeaderText = "PID",
-                Width = 75
-            };
-
-            var colMem = new DataGridViewTextBoxColumn
-            {
-                Name = "colMem",
-                HeaderText = "MEMÓRIA",
-                Width = 100
-            };
-
-            var colUptime = new DataGridViewTextBoxColumn
-            {
-                Name = "colUptime",
-                HeaderText = "TEMPO ATIVO",
-                Width = 110
-            };
-
-            var colReason = new DataGridViewTextBoxColumn
-            {
-                Name = "colReason",
-                HeaderText = "DETALHES / MOTIVO",
-                AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
-                MinimumWidth = 180
-            };
-
-            dgv.Columns.AddRange(new DataGridViewColumn[] {
-                colStatus, colName, colCategory, colPid, colMem, colUptime, colReason
-            });
-
-            dgv.CellDoubleClick += (s, e) =>
-            {
-                if (e.RowIndex >= 0 && e.RowIndex < dgv.Rows.Count)
+                if (e.RowIndex >= 0 && (e.PaintParts & DataGridViewPaintParts.Focus) != 0)
                 {
-                    try
-                    {
-                        int pid = Convert.ToInt32(dgv.Rows[e.RowIndex].Cells["colPid"].Value);
-                        string name = dgv.Rows[e.RowIndex].Cells["colName"].Value.ToString();
-                        FocusAndNotify(pid, name);
-                    }
-                    catch { }
-                }
-            };
-
-            dgv.KeyDown += (s, e) =>
-            {
-                if (e.KeyCode == Keys.Enter && dgv.SelectedRows.Count > 0)
-                {
+                    e.Paint(e.ClipBounds, e.PaintParts & ~DataGridViewPaintParts.Focus);
                     e.Handled = true;
-                    try
-                    {
-                        int pid = Convert.ToInt32(dgv.SelectedRows[0].Cells["colPid"].Value);
-                        string name = dgv.SelectedRows[0].Cells["colName"].Value.ToString();
-                        FocusAndNotify(pid, name);
-                    }
-                    catch { }
                 }
             };
 
-            // Custom row highlighting for alerts
+            // Custom row styling (mantendo sem faixa azul ao selecionar)
             dgv.RowPrePaint += (s, e) =>
             {
                 if (e.RowIndex >= 0 && e.RowIndex < currentProcesses.Count)
@@ -1329,12 +1390,111 @@ namespace AIProcessMonitor
                     {
                         dgv.Rows[e.RowIndex].DefaultCellStyle.BackColor = Color.FromArgb(69, 10, 10); // red-950
                         dgv.Rows[e.RowIndex].DefaultCellStyle.ForeColor = Color.FromArgb(254, 202, 202);
-                        dgv.Rows[e.RowIndex].DefaultCellStyle.SelectionBackColor = Color.FromArgb(153, 27, 27);
+                        dgv.Rows[e.RowIndex].DefaultCellStyle.SelectionBackColor = Color.FromArgb(69, 10, 10);
+                        dgv.Rows[e.RowIndex].DefaultCellStyle.SelectionForeColor = Color.FromArgb(254, 202, 202);
+                    }
+                    else
+                    {
+                        Color rowBg = (e.RowIndex % 2 == 0) ? Color.FromArgb(30, 41, 59) : Color.FromArgb(24, 34, 50);
+                        dgv.Rows[e.RowIndex].DefaultCellStyle.SelectionBackColor = rowBg;
+                        dgv.Rows[e.RowIndex].DefaultCellStyle.SelectionForeColor = Color.FromArgb(248, 250, 252);
                     }
                 }
             };
 
-            // 4. Status Strip
+            // Requisito 2: "Preciso de uma coluna que mostre o consumo de CPU."
+            var colStatus = new DataGridViewTextBoxColumn
+            {
+                Name = "colStatus",
+                HeaderText = "STATUS",
+                Width = 145
+            };
+
+            var colName = new DataGridViewTextBoxColumn
+            {
+                Name = "colName",
+                HeaderText = "APLICAÇÃO / IA",
+                Width = 215
+            };
+
+            var colCategory = new DataGridViewTextBoxColumn
+            {
+                Name = "colCategory",
+                HeaderText = "CATEGORIA",
+                Width = 150
+            };
+
+            var colPid = new DataGridViewTextBoxColumn
+            {
+                Name = "colPid",
+                HeaderText = "PID",
+                Width = 65
+            };
+
+            var colCpu = new DataGridViewTextBoxColumn
+            {
+                Name = "colCpu",
+                HeaderText = "CPU (%)",
+                Width = 85
+            };
+
+            var colMem = new DataGridViewTextBoxColumn
+            {
+                Name = "colMem",
+                HeaderText = "MEMÓRIA",
+                Width = 95
+            };
+
+            var colUptime = new DataGridViewTextBoxColumn
+            {
+                Name = "colUptime",
+                HeaderText = "TEMPO ATIVO",
+                Width = 105
+            };
+
+            var colReason = new DataGridViewTextBoxColumn
+            {
+                Name = "colReason",
+                HeaderText = "DETALHES / MOTIVO",
+                AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill,
+                MinimumWidth = 170
+            };
+
+            dgv.Columns.AddRange(new DataGridViewColumn[] {
+                colStatus, colName, colCategory, colPid, colCpu, colMem, colUptime, colReason
+            });
+
+            // Requisitos 3 & 4: Clicar no processo mostra todos os detalhes na tela de detalhes
+            dgv.CellClick += (s, e) =>
+            {
+                if (e.RowIndex >= 0 && e.RowIndex < dgv.Rows.Count)
+                {
+                    try
+                    {
+                        int pid = Convert.ToInt32(dgv.Rows[e.RowIndex].Cells["colPid"].Value);
+                        SelectAndDisplayProcess(pid);
+                    }
+                    catch { }
+                }
+            };
+
+            dgv.SelectionChanged += (s, e) =>
+            {
+                if (dgv.SelectedRows.Count > 0 && dgv.SelectedRows[0].Index >= 0)
+                {
+                    try
+                    {
+                        int pid = Convert.ToInt32(dgv.SelectedRows[0].Cells["colPid"].Value);
+                        SelectAndDisplayProcess(pid);
+                    }
+                    catch { }
+                }
+            };
+
+            // 4. Details Screen Panel (Requisitos 3 & 4)
+            InitializeDetailsPanel();
+
+            // 5. Status Strip
             statusStrip = new StatusStrip
             {
                 BackColor = Color.FromArgb(15, 23, 42),
@@ -1352,7 +1512,7 @@ namespace AIProcessMonitor
 
             actionLabel = new ToolStripStatusLabel
             {
-                Text = "💡 Dica: Dê um duplo-clique em qualquer linha para abrir a janela da aplicação.",
+                Text = "💡 Dica: Clique no processo para ver detalhes e na tela de detalhes para alternar o foco.",
                 ForeColor = Color.FromArgb(148, 163, 184),
                 Spring = true,
                 TextAlign = ContentAlignment.MiddleRight
@@ -1370,7 +1530,7 @@ namespace AIProcessMonitor
 
             statusStrip.Items.AddRange(new ToolStripItem[] { statusLabel, actionLabel, versionStatusLabel });
 
-            // 5. System Tray Icon
+            // 6. System Tray Icon
             try
             {
                 trayIcon = new NotifyIcon
@@ -1407,11 +1567,12 @@ namespace AIProcessMonitor
             }
             catch { }
 
-            // Add controls to Form
-            this.Controls.Add(dgv);
-            this.Controls.Add(alertBanner);
-            this.Controls.Add(headerPanel);
-            this.Controls.Add(statusStrip);
+            // Add controls to Form with proper docking precedence
+            this.Controls.Add(dgv);           // Dock = Fill
+            this.Controls.Add(detailsPanel);  // Dock = Bottom (Height = 225)
+            this.Controls.Add(alertBanner);   // Dock = Top (Height = 52)
+            this.Controls.Add(headerPanel);   // Dock = Top (Height = 120)
+            this.Controls.Add(statusStrip);   // Dock = Bottom (Height = 32)
 
             // Timer for automatic background refresh
             refreshTimer = new System.Windows.Forms.Timer
@@ -1420,6 +1581,183 @@ namespace AIProcessMonitor
             };
             refreshTimer.Tick += (s, e) => RefreshData();
             refreshTimer.Start();
+
+            // Requisito 5: "Tocar alerta de ação humana a cada 4 segundos, enquanto o humano não der sequência ao processo."
+            audioAlertTimer = new System.Windows.Forms.Timer
+            {
+                Interval = 4000
+            };
+            audioAlertTimer.Tick += (s, e) =>
+            {
+                if (currentProcesses != null && currentProcesses.Any(p => p.needsHumanInput))
+                {
+                    PlayHumanAlertSound();
+                }
+                else
+                {
+                    audioAlertTimer.Stop();
+                }
+            };
+        }
+
+        private void InitializeDetailsPanel()
+        {
+            detailsPanel = new Panel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 230,
+                BackColor = Color.FromArgb(15, 23, 42),
+                Padding = new Padding(16, 6, 16, 8),
+                Cursor = Cursors.Hand
+            };
+
+            // Desenhar linha de separação no topo do painel de detalhes
+            detailsPanel.Paint += (s, e) =>
+            {
+                using (var pen = new Pen(Color.FromArgb(51, 65, 85), 1))
+                {
+                    e.Graphics.DrawLine(pen, 0, 0, detailsPanel.Width, 0);
+                }
+            };
+
+            // Ao clicar em qualquer ponto do painel de detalhes, o foco muda para a janela do aplicativo (Requisito 4)
+            detailsPanel.Click += (s, e) => FocusSelectedProcess();
+
+            lblDetailHeader = new Label
+            {
+                Text = "📋 DETALHES DO PROCESSO SELECIONADO",
+                Font = new Font("Segoe UI", 10.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(56, 189, 248), // sky-400
+                AutoSize = true,
+                Location = new Point(14, 8),
+                Cursor = Cursors.Hand
+            };
+            lblDetailHeader.Click += (s, e) => FocusSelectedProcess();
+
+            lblDetailSubtitle = new Label
+            {
+                Text = "💡 Dica: Clique em qualquer lugar deste painel para alternar o foco para o aplicativo selecionado.",
+                Font = new Font("Segoe UI", 8.2f, FontStyle.Italic),
+                ForeColor = Color.FromArgb(148, 163, 184),
+                AutoSize = true,
+                Location = new Point(16, 30),
+                Cursor = Cursors.Hand
+            };
+            lblDetailSubtitle.Click += (s, e) => FocusSelectedProcess();
+
+            btnDetailFocus = new Button
+            {
+                Text = "🎯 CLIQUE AQUI PARA ABRIR A JANELA DO APLICATIVO",
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                BackColor = Color.FromArgb(37, 99, 235), // blue-600
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Cursor = Cursors.Hand,
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
+                Size = new Size(410, 32),
+                Location = new Point(detailsPanel.Width - 430, 6)
+            };
+            btnDetailFocus.FlatAppearance.BorderSize = 0;
+            btnDetailFocus.Click += (s, e) => FocusSelectedProcess();
+
+            detailsPanel.Resize += (s, e) =>
+            {
+                btnDetailFocus.Location = new Point(detailsPanel.Width - 430, 6);
+            };
+
+            // Layout com 3 cartões de detalhes proporcionais
+            var tlp = new TableLayoutPanel
+            {
+                Location = new Point(12, 50),
+                Size = new Size(detailsPanel.Width - 24, 170),
+                Anchor = AnchorStyles.Top | AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right,
+                ColumnCount = 3,
+                RowCount = 1,
+                BackColor = Color.Transparent
+            };
+            tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33f));
+            tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33f));
+            tlp.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.34f));
+            tlp.RowStyles.Add(new RowStyle(SizeType.Percent, 100f));
+            tlp.Click += (s, e) => FocusSelectedProcess();
+
+            // Card 1: Identificação & Status
+            cardDetail1 = CreateDetailCard("📌 IDENTIFICAÇÃO & STATUS", Color.FromArgb(251, 191, 36));
+            lblD1_Name = AddDetailField(cardDetail1, "Aplicação:", "--", true, Color.White, 30);
+            lblD1_Bin = AddDetailField(cardDetail1, "Executável:", "--", false, Color.FromArgb(203, 213, 225), 54);
+            lblD1_Cat = AddDetailField(cardDetail1, "Categoria:", "--", false, Color.FromArgb(203, 213, 225), 78);
+            lblD1_Status = AddDetailField(cardDetail1, "Status:", "--", true, Color.FromArgb(74, 222, 128), 102);
+            lblD1_Reason = AddDetailField(cardDetail1, "Motivo:", "--", false, Color.FromArgb(226, 232, 240), 126);
+
+            // Card 2: Consumo & Performance
+            cardDetail2 = CreateDetailCard("⚡ RECURSOS DO SISTEMA", Color.FromArgb(74, 222, 128));
+            lblD2_Cpu = AddDetailField(cardDetail2, "Uso de CPU:", "--", true, Color.FromArgb(56, 189, 248), 30);
+            lblD2_Mem = AddDetailField(cardDetail2, "Memória RAM:", "--", false, Color.FromArgb(203, 213, 225), 54);
+            lblD2_Peak = AddDetailField(cardDetail2, "Pico de RAM:", "--", false, Color.FromArgb(203, 213, 225), 78);
+            lblD2_Threads = AddDetailField(cardDetail2, "Threads / Prioridade:", "--", false, Color.FromArgb(203, 213, 225), 102);
+            lblD2_Uptime = AddDetailField(cardDetail2, "Tempo Ativo:", "--", false, Color.FromArgb(203, 213, 225), 126);
+
+            // Card 3: Janela & Caminho
+            cardDetail3 = CreateDetailCard("🪟 JANELA & COMANDO", Color.FromArgb(192, 132, 252));
+            lblD3_WinTitle = AddDetailField(cardDetail3, "Título da Janela:", "--", true, Color.White, 30);
+            lblD3_Path = AddDetailField(cardDetail3, "Caminho no Disco:", "--", false, Color.FromArgb(203, 213, 225), 56, 32);
+            lblD3_Cmd = AddDetailField(cardDetail3, "Linha de Comando:", "--", false, Color.FromArgb(148, 163, 184), 92, 42);
+
+            tlp.Controls.Add(cardDetail1, 0, 0);
+            tlp.Controls.Add(cardDetail2, 1, 0);
+            tlp.Controls.Add(cardDetail3, 2, 0);
+
+            detailsPanel.Controls.Add(lblDetailHeader);
+            detailsPanel.Controls.Add(lblDetailSubtitle);
+            detailsPanel.Controls.Add(btnDetailFocus);
+            detailsPanel.Controls.Add(tlp);
+        }
+
+        private Panel CreateDetailCard(string title, Color headerColor)
+        {
+            var pnl = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.FromArgb(30, 41, 59), // slate-800
+                Margin = new Padding(4),
+                Padding = new Padding(10, 8, 10, 8),
+                Cursor = Cursors.Hand
+            };
+            pnl.Click += (s, e) => FocusSelectedProcess();
+
+            var lblT = new Label
+            {
+                Text = title,
+                Font = new Font("Segoe UI", 8.2f, FontStyle.Bold),
+                ForeColor = headerColor,
+                Location = new Point(10, 8),
+                AutoSize = true,
+                Cursor = Cursors.Hand
+            };
+            lblT.Click += (s, e) => FocusSelectedProcess();
+            pnl.Controls.Add(lblT);
+
+            return pnl;
+        }
+
+        private Label AddDetailField(Panel parent, string prefix, string initialValue, bool isBold, Color foreColor, int topY, int height = 22)
+        {
+            var lbl = new Label
+            {
+                Text = prefix + " " + initialValue,
+                Font = new Font("Segoe UI", isBold ? 9f : 8.3f, isBold ? FontStyle.Bold : FontStyle.Regular),
+                ForeColor = foreColor,
+                Location = new Point(10, topY),
+                AutoSize = false,
+                Width = Math.Max(100, parent.Width - 20),
+                Height = height,
+                AutoEllipsis = true,
+                Cursor = Cursors.Hand,
+                Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right
+            };
+            lbl.Click += (s, e) => FocusSelectedProcess();
+            parent.Controls.Add(lbl);
+            return lbl;
         }
 
         private Panel CreateMetricCard(string title, string initialValue, Color accentColor, int x, int y, out Label valueLabel)
@@ -1514,6 +1852,13 @@ namespace AIProcessMonitor
                 lblAlertBanner.Text = string.Format("🚨 AÇÃO HUMANA NECESSÁRIA: {0} ({1})", firstAlert.friendlyName, firstAlert.statusReason);
                 alertBanner.Visible = true;
 
+                // Requisito 5: Iniciar alarme sonoro a cada 4s enquanto não houver ação humana
+                if (!audioAlertTimer.Enabled)
+                {
+                    PlayHumanAlertSound();
+                    audioAlertTimer.Start();
+                }
+
                 // Show Tray notification once when alert starts
                 if (!hadAlertBefore && trayIcon != null)
                 {
@@ -1532,35 +1877,124 @@ namespace AIProcessMonitor
                 lblAlertValue.ForeColor = Color.FromArgb(34, 197, 94); // green-500
                 alertBanner.Visible = false;
                 hadAlertBefore = false;
+
+                if (audioAlertTimer.Enabled)
+                {
+                    audioAlertTimer.Stop();
+                }
             }
 
-            // Populate / Refresh Grid Rows smoothly
-            int selectedPid = -1;
-            if (dgv.SelectedRows.Count > 0)
-            {
-                try { selectedPid = Convert.ToInt32(dgv.SelectedRows[0].Cells["colPid"].Value); } catch { }
-            }
-
+            // Populate Grid Rows smoothly
             dgv.Rows.Clear();
-            foreach (var p in list)
+            int selectedRowIndex = -1;
+            for (int i = 0; i < list.Count; i++)
             {
+                var p = list[i];
                 string statusDisplay = p.needsHumanInput ? "🔴 AÇÃO HUMANA" : "🟢 Ativo";
                 string nameDisplay = p.friendlyName + " (" + p.processName + ")";
 
-                int rowIndex = dgv.Rows.Add(
+                dgv.Rows.Add(
                     statusDisplay,
                     nameDisplay,
                     p.category,
                     p.pid,
-                    p.memoryMB + " MB",
+                    p.cpuPercent.ToString("0.0") + " %",
+                    p.memoryMB.ToString("0.0") + " MB",
                     p.uptimeHuman,
                     p.statusReason
                 );
 
                 if (p.pid == selectedPid)
                 {
-                    dgv.Rows[rowIndex].Selected = true;
+                    selectedRowIndex = i;
                 }
+            }
+
+            if (selectedRowIndex >= 0 && selectedRowIndex < dgv.Rows.Count)
+            {
+                dgv.Rows[selectedRowIndex].Selected = true;
+                var currentProc = list.FirstOrDefault(p => p.pid == selectedPid);
+                if (currentProc != null)
+                {
+                    UpdateDetailsDisplay(currentProc);
+                }
+            }
+            else if (selectedPid == -1 && list.Count > 0)
+            {
+                selectedPid = list[0].pid;
+                dgv.Rows[0].Selected = true;
+                UpdateDetailsDisplay(list[0]);
+            }
+        }
+
+        // Requisito 3: Mostrar todos os detalhes possíveis ao clicar no processo
+        private void SelectAndDisplayProcess(int pid)
+        {
+            selectedPid = pid;
+            var proc = currentProcesses.FirstOrDefault(p => p.pid == pid);
+            if (proc != null)
+            {
+                UpdateDetailsDisplay(proc);
+            }
+        }
+
+        private void UpdateDetailsDisplay(ProcessInfo p)
+        {
+            if (p == null)
+            {
+                lblDetailHeader.Text = "📋 DETALHES DO PROCESSO";
+                lblDetailSubtitle.Text = "💡 Selecione qualquer processo na lista acima para visualizar todos os detalhes aqui.";
+                btnDetailFocus.Text = "🎯 CLIQUE AQUI PARA ABRIR A JANELA DO APLICATIVO";
+                btnDetailFocus.BackColor = Color.FromArgb(51, 65, 85);
+                return;
+            }
+
+            selectedPid = p.pid;
+            lblDetailHeader.Text = "📋 DETALHES DO PROCESSO: " + p.friendlyName + " (PID " + p.pid + ")";
+            lblDetailSubtitle.Text = "💡 Clique em qualquer lugar deste painel para alternar o foco para o aplicativo.";
+
+            lblD1_Name.Text = "Aplicação: " + p.friendlyName;
+            lblD1_Bin.Text = "Executável: " + p.processName + ".exe (PID: " + p.pid + ")";
+            lblD1_Cat.Text = "Categoria: " + p.category;
+            lblD1_Status.Text = "Status: " + (p.needsHumanInput ? "🔴 AGUARDANDO AÇÃO HUMANA" : "🟢 Em Execução / Ativo");
+            lblD1_Status.ForeColor = p.needsHumanInput ? Color.FromArgb(248, 113, 113) : Color.FromArgb(74, 222, 128);
+            lblD1_Reason.Text = "Motivo: " + p.statusReason;
+
+            lblD2_Cpu.Text = "Consumo de CPU: " + p.cpuPercent.ToString("0.0") + " %";
+            lblD2_Mem.Text = "Memória RAM: " + p.memoryMB.ToString("0.0") + " MB";
+            lblD2_Peak.Text = "Pico de RAM: " + (p.peakMemoryMB > 0 ? p.peakMemoryMB.ToString("0.0") + " MB" : "--");
+            lblD2_Threads.Text = "Threads: " + (p.threadsCount > 0 ? p.threadsCount.ToString() : "--") + " | Prioridade: " + (string.IsNullOrEmpty(p.priority) ? "Normal" : p.priority);
+            lblD2_Uptime.Text = "Tempo Ativo: " + p.uptimeHuman + " (Início: " + p.startTime + ")";
+
+            lblD3_WinTitle.Text = "Título da Janela: " + (string.IsNullOrEmpty(p.windowTitle) ? "(Nenhuma janela visível direta)" : p.windowTitle);
+            lblD3_Path.Text = "Caminho: " + (string.IsNullOrEmpty(p.executablePath) ? "--" : p.executablePath);
+            lblD3_Cmd.Text = "Comando: " + (string.IsNullOrEmpty(p.commandLine) ? "--" : p.commandLine);
+
+            if (p.needsHumanInput)
+            {
+                btnDetailFocus.BackColor = Color.FromArgb(220, 38, 38);
+                btnDetailFocus.Text = "🚨 CLIQUE AQUI PARA ABRIR A JANELA E INTERVIR";
+            }
+            else
+            {
+                btnDetailFocus.BackColor = Color.FromArgb(37, 99, 235);
+                btnDetailFocus.Text = "🎯 CLIQUE AQUI PARA ABRIR A JANELA DESTE APLICATIVO";
+            }
+        }
+
+        // Requisito 4: "Só quando clicar sobre a tela de detalhes, é que o foco muda para a janela onde o aplicativo está sendo executado."
+        private void FocusSelectedProcess()
+        {
+            if (selectedPid > 0)
+            {
+                var proc = currentProcesses.FirstOrDefault(p => p.pid == selectedPid);
+                string name = proc != null ? proc.friendlyName : ("PID " + selectedPid);
+                FocusAndNotify(selectedPid, name);
+            }
+            else
+            {
+                actionLabel.Text = "ℹ️ Nenhum processo selecionado para focar.";
+                actionLabel.ForeColor = Color.FromArgb(148, 163, 184);
             }
         }
 
@@ -1593,9 +2027,23 @@ namespace AIProcessMonitor
             });
         }
 
+        // Requisito 5: Tocar alerta sonoro de ação humana
+        private void PlayHumanAlertSound()
+        {
+            try
+            {
+                System.Media.SystemSounds.Exclamation.Play();
+            }
+            catch
+            {
+                try { Console.Beep(1000, 200); } catch { }
+            }
+        }
+
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
             if (refreshTimer != null) refreshTimer.Stop();
+            if (audioAlertTimer != null) audioAlertTimer.Stop();
             if (trayIcon != null) trayIcon.Dispose();
             base.OnFormClosing(e);
         }
@@ -1611,9 +2059,15 @@ namespace AIProcessMonitor
         public string startTime { get; set; }
         public double uptimeSeconds { get; set; }
         public string uptimeHuman { get; set; }
+        public double cpuPercent { get; set; }
         public double memoryMB { get; set; }
         public string commandLine { get; set; }
         public bool needsHumanInput { get; set; }
         public string statusReason { get; set; }
+        public string executablePath { get; set; }
+        public string windowTitle { get; set; }
+        public string priority { get; set; }
+        public int threadsCount { get; set; }
+        public double peakMemoryMB { get; set; }
     }
 }

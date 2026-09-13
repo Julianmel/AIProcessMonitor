@@ -441,6 +441,91 @@
     tbody tr.needs-input:hover {
       background: rgba(239, 68, 68, 0.16);
     }
+    tbody tr.selected-row {
+      background: #1e293b !important;
+      border-left: 4px solid #38bdf8 !important;
+    }
+
+    /* Details Section Styling */
+    .details-section {
+      margin-top: 24px;
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 14px;
+      padding: 20px;
+      cursor: pointer;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .details-section:hover {
+      border-color: #38bdf8;
+      box-shadow: 0 4px 20px rgba(56, 189, 248, 0.15);
+    }
+    .details-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .details-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: #38bdf8;
+    }
+    .btn-det-focus {
+      background: #2563eb;
+      color: white;
+      border: none;
+      padding: 8px 18px;
+      border-radius: 8px;
+      font-weight: 700;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .btn-det-focus.alert {
+      background: #dc2626;
+    }
+    .btn-det-focus:hover {
+      filter: brightness(1.1);
+    }
+    .details-subtitle {
+      font-size: 0.8rem;
+      color: #94a3b8;
+      font-style: italic;
+      margin-bottom: 16px;
+    }
+    .details-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 14px;
+    }
+    .det-card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .det-card-title {
+      font-size: 0.78rem;
+      font-weight: 800;
+      margin-bottom: 4px;
+    }
+    .det-field {
+      font-size: 0.82rem;
+      color: #cbd5e1;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .det-field strong {
+      color: #94a3b8;
+      font-size: 0.76rem;
+    }
 
     tbody td {
       padding: 14px 16px;
@@ -612,8 +697,8 @@
       <div class="brand">
         <div class="brand-icon">⚡</div>
         <div>
-          <h1>AI Process Monitor <span style="font-size: 0.75rem; background: #334155; color: #38bdf8; padding: 2px 8px; border-radius: 9999px; margin-left: 6px; vertical-align: middle;">v1.2.1</span></h1>
-          <p>Painel em tempo real • Dê um duplo-clique em qualquer processo para abrir sua janela</p>
+          <h1>AI Process Monitor <span style="font-size: 0.75rem; background: #334155; color: #38bdf8; padding: 2px 8px; border-radius: 9999px; margin-left: 6px; vertical-align: middle;">v1.3.0</span></h1>
+          <p>Painel em tempo real • Clique no processo para ver detalhes e na tela de detalhes para focar</p>
         </div>
       </div>
       <div class="header-actions">
@@ -721,19 +806,53 @@
             <th>Status</th>
             <th>Processo / Aplicação</th>
             <th>PID</th>
-            <th>Categoria</th>
-            <th>Tempo Ativo (Uptime)</th>
+            <th>CPU</th>
             <th>Memória RAM</th>
+            <th>Tempo Ativo</th>
+            <th>Categoria</th>
           </tr>
         </thead>
         <tbody id="processTbody">
           <tr>
-            <td colspan="6" style="text-align: center; padding: 32px; color: var(--text-muted);">
+            <td colspan="7" style="text-align: center; padding: 32px; color: var(--text-muted);">
               Carregando processos...
             </td>
           </tr>
         </tbody>
       </table>
+    </div>
+
+    <!-- Process Details Section (Requisitos 3 & 4) -->
+    <div id="detailsSection" class="details-section" onclick="focusSelectedProcess()" title="Clique neste painel para focar a janela do aplicativo">
+      <div class="details-header">
+        <div class="details-title" id="detTitle">📋 DETALHES DO PROCESSO SELECIONADO</div>
+        <button id="detBtnFocus" class="btn-det-focus">🎯 Clique aqui para abrir a janela do aplicativo</button>
+      </div>
+      <div class="details-subtitle" id="detSubtitle">💡 Clique em qualquer lugar deste painel para alternar o foco para o aplicativo selecionado</div>
+      <div class="details-grid">
+        <div class="det-card">
+          <div class="det-card-title" style="color: #fbbf24;">📌 IDENTIFICAÇÃO & STATUS</div>
+          <div class="det-field"><strong>Aplicação:</strong> <span id="detFriendly">--</span></div>
+          <div class="det-field"><strong>Executável:</strong> <span id="detBin">--</span></div>
+          <div class="det-field"><strong>Categoria:</strong> <span id="detCat">--</span></div>
+          <div class="det-field"><strong>Status:</strong> <span id="detStatus">--</span></div>
+          <div class="det-field"><strong>Motivo:</strong> <span id="detReason">--</span></div>
+        </div>
+        <div class="det-card">
+          <div class="det-card-title" style="color: #4ade80;">⚡ RECURSOS DO SISTEMA</div>
+          <div class="det-field"><strong>Consumo de CPU:</strong> <span id="detCpu" style="color:#38bdf8; font-weight:bold;">--</span></div>
+          <div class="det-field"><strong>Memória RAM:</strong> <span id="detMem">--</span></div>
+          <div class="det-field"><strong>Pico de Memória:</strong> <span id="detPeak">--</span></div>
+          <div class="det-field"><strong>Threads / Prioridade:</strong> <span id="detThreads">--</span></div>
+          <div class="det-field"><strong>Tempo Ativo:</strong> <span id="detUptime">--</span></div>
+        </div>
+        <div class="det-card">
+          <div class="det-card-title" style="color: #c084fc;">🪟 JANELA & COMANDO</div>
+          <div class="det-field"><strong>Título da Janela:</strong> <span id="detWin">--</span></div>
+          <div class="det-field"><strong>Caminho:</strong> <span id="detPath" style="word-break:break-all;">--</span></div>
+          <div class="det-field"><strong>Comando:</strong> <span id="detCmd" style="word-break:break-all; color:#94a3b8;">--</span></div>
+        </div>
+      </div>
     </div>
 
     <!-- Toast Notification -->
@@ -744,7 +863,7 @@
 
     <!-- Footer -->
     <footer>
-      <span>AI Process Monitor v1.2.1 • Dica: Dê um duplo-clique na linha para focar a janela</span>
+      <span>AI Process Monitor v1.3.0 • Dica: Clique no processo para ver detalhes e na tela de detalhes para focar</span>
       <span id="lastUpdatedLabel">Última checagem: --</span>
     </footer>
   </div>
@@ -921,10 +1040,84 @@
         document.getElementById('card-alert-count').classList.remove('alert-stat');
       }
 
+      // Requisito 5: Tocar alerta sonoro a cada 4 segundos no navegador enquanto houver alerta
+      handleAudioAlerts(alertCount > 0);
+
       const totalMem = rawProcesses.reduce((acc, cur) => acc + (cur.memoryMB || 0), 0);
       document.getElementById('stat-mem').textContent = totalMem > 1024 
         ? `${(totalMem / 1024).toFixed(2)} GB` 
         : `${totalMem.toFixed(1)} MB`;
+
+      renderDetails();
+    }
+
+    let repeatingAudioTimer = null;
+    function handleAudioAlerts(hasAlert) {
+      if (hasAlert) {
+        if (!repeatingAudioTimer) {
+          playAlertChime();
+          repeatingAudioTimer = setInterval(playAlertChime, 4000);
+        }
+      } else {
+        if (repeatingAudioTimer) {
+          clearInterval(repeatingAudioTimer);
+          repeatingAudioTimer = null;
+        }
+      }
+    }
+
+    let selectedPid = null;
+
+    function selectProcess(pid) {
+      selectedPid = pid;
+      renderTable();
+      renderDetails();
+    }
+
+    function focusSelectedProcess() {
+      if (!selectedPid && rawProcesses.length > 0) {
+        selectedPid = rawProcesses[0].pid;
+      }
+      if (!selectedPid) return;
+      const p = rawProcesses.find(x => x.pid === selectedPid);
+      if (p) focusWindow(p.pid, p.friendlyName);
+    }
+
+    function renderDetails() {
+      if (!selectedPid && rawProcesses.length > 0) {
+        selectedPid = rawProcesses[0].pid;
+      }
+      const p = rawProcesses.find(x => x.pid === selectedPid);
+      if (!p) return;
+
+      document.getElementById('detTitle').textContent = `📋 DETALHES DO PROCESSO: ${p.friendlyName} (PID ${p.pid})`;
+      document.getElementById('detFriendly').textContent = p.friendlyName;
+      document.getElementById('detBin').textContent = `${p.processName}.exe (PID ${p.pid})`;
+      document.getElementById('detCat').textContent = p.category || '--';
+      
+      const statusEl = document.getElementById('detStatus');
+      statusEl.textContent = p.needsHumanInput ? '🔴 AGUARDANDO AÇÃO HUMANA' : '🟢 Em Execução / Ativo';
+      statusEl.style.color = p.needsHumanInput ? '#f87171' : '#4ade80';
+      statusEl.style.fontWeight = 'bold';
+      
+      document.getElementById('detReason').textContent = p.statusReason || '--';
+      document.getElementById('detCpu').textContent = `${(p.cpuPercent || 0).toFixed(1)} %`;
+      document.getElementById('detMem').textContent = `${(p.memoryMB || 0).toFixed(1)} MB`;
+      document.getElementById('detPeak').textContent = p.peakMemoryMB ? `${p.peakMemoryMB.toFixed(1)} MB` : '--';
+      document.getElementById('detThreads').textContent = `${p.threadsCount || '--'} | Prioridade: ${p.priority || 'Normal'}`;
+      document.getElementById('detUptime').textContent = `${formatUptime(p.uptimeSeconds)} (Início: ${p.startTime || '--'})`;
+      document.getElementById('detWin').textContent = p.windowTitle || '(Nenhuma janela visível direta)';
+      document.getElementById('detPath').textContent = p.executablePath || '--';
+      document.getElementById('detCmd').textContent = p.commandLine || '--';
+
+      const btn = document.getElementById('detBtnFocus');
+      if (p.needsHumanInput) {
+        btn.className = 'btn-det-focus alert';
+        btn.textContent = '🚨 CLIQUE AQUI PARA ABRIR A JANELA E INTERVIR';
+      } else {
+        btn.className = 'btn-det-focus';
+        btn.textContent = '🎯 CLIQUE AQUI PARA ABRIR A JANELA DO APLICATIVO';
+      }
     }
 
     function getAvatarClass(name) {
@@ -974,9 +1167,10 @@
       tbody.innerHTML = filtered.map(p => {
         const avatar = getAvatarClass(p.processName);
         const isAlert = !!p.needsHumanInput;
+        const isSelected = (selectedPid === p.pid);
 
         return `
-          <tr class="${isAlert ? 'needs-input' : ''}" ondblclick="focusWindow(${p.pid}, '${p.friendlyName.replace(/'/g, "\\'")}')" title="Dê um duplo-clique para abrir a janela da aplicação">
+          <tr class="${isAlert ? 'needs-input' : ''} ${isSelected ? 'selected-row' : ''}" onclick="selectProcess(${p.pid})" title="Clique para ver os detalhes deste processo">
             <td>
               ${isAlert 
                 ? `<span class="status-badge alert" title="${p.statusReason || ''}">🔴 AGUARDANDO AÇÃO HUMANA</span>`
@@ -998,13 +1192,16 @@
               <span class="pid-badge">${p.pid}</span>
             </td>
             <td>
-              <span style="font-size: 0.78rem; color: #cbd5e1;">${p.category}</span>
+              <span style="font-family: monospace; font-size: 0.82rem; font-weight: 600; color: #38bdf8;">${(p.cpuPercent || 0).toFixed(1)}%</span>
+            </td>
+            <td>
+              <span style="font-family: monospace; font-size: 0.82rem;">${p.memoryMB ? p.memoryMB.toFixed(1) + ' MB' : '--'}</span>
             </td>
             <td>
               <span class="uptime-badge" id="uptime-${p.pid}">${formatUptime(p.uptimeSeconds)}</span>
             </td>
             <td>
-              <span style="font-family: monospace; font-size: 0.82rem;">${p.memoryMB ? p.memoryMB.toFixed(1) + ' MB' : '--'}</span>
+              <span style="font-size: 0.78rem; color: #cbd5e1;">${p.category}</span>
             </td>
           </tr>
         `;
