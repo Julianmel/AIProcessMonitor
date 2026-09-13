@@ -446,62 +446,90 @@
       border-left: 4px solid #38bdf8 !important;
     }
 
-    /* Details Section Styling */
-    .details-section {
-      margin-top: 24px;
+    /* Modal Subwindow Overlay */
+    .modal-overlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100vw;
+      height: 100vh;
+      background: rgba(15, 23, 42, 0.75);
+      backdrop-filter: blur(4px);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 10000;
+      animation: fadeIn 0.2s ease-out;
+    }
+    .modal-overlay.active {
+      display: flex;
+    }
+    .modal-card {
+      width: 92%;
+      max-width: 860px;
       background: #0f172a;
-      border: 1px solid #334155;
+      border: 2px solid #38bdf8;
       border-radius: 14px;
-      padding: 20px;
+      padding: 22px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.7), 0 0 30px rgba(56, 189, 248, 0.25);
       cursor: pointer;
-      transition: border-color 0.2s, box-shadow 0.2s;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      animation: scaleUp 0.2s ease-out;
     }
-    .details-section:hover {
-      border-color: #38bdf8;
-      box-shadow: 0 4px 20px rgba(56, 189, 248, 0.15);
-    }
-    .details-header {
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes scaleUp { from { transform: scale(0.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+    .modal-header {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 6px;
-      flex-wrap: wrap;
-      gap: 12px;
     }
-    .details-title {
-      font-size: 1.05rem;
+    .modal-title {
+      font-size: 1.15rem;
       font-weight: 700;
       color: #38bdf8;
     }
-    .btn-det-focus {
+    .modal-close-btn {
+      background: transparent;
+      border: none;
+      color: #94a3b8;
+      font-size: 1.3rem;
+      font-weight: bold;
+      cursor: pointer;
+      padding: 4px 8px;
+      border-radius: 6px;
+      transition: all 0.2s;
+    }
+    .modal-close-btn:hover {
+      color: #ef4444;
+      background: rgba(239, 68, 68, 0.1);
+    }
+    .modal-banner {
+      padding: 12px 18px;
+      border-radius: 8px;
       background: #2563eb;
       color: white;
-      border: none;
-      padding: 8px 18px;
-      border-radius: 8px;
       font-weight: 700;
-      font-size: 0.85rem;
-      cursor: pointer;
+      font-size: 0.95rem;
+      text-align: center;
       transition: background 0.2s;
     }
-    .btn-det-focus.alert {
+    .modal-banner.alert {
       background: #dc2626;
     }
-    .btn-det-focus:hover {
-      filter: brightness(1.1);
-    }
-    .details-subtitle {
+    .modal-hint {
       font-size: 0.8rem;
       color: #94a3b8;
       font-style: italic;
-      margin-bottom: 16px;
     }
-    .details-grid {
+    .modal-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
       gap: 14px;
     }
-    .det-card {
+    .m-card {
       background: #1e293b;
       border: 1px solid #334155;
       border-radius: 10px;
@@ -510,21 +538,21 @@
       flex-direction: column;
       gap: 8px;
     }
-    .det-card-title {
-      font-size: 0.78rem;
+    .m-card-title {
+      font-size: 0.8rem;
       font-weight: 800;
-      margin-bottom: 4px;
+      margin-bottom: 2px;
     }
-    .det-field {
+    .m-field {
       font-size: 0.82rem;
       color: #cbd5e1;
       display: flex;
       flex-direction: column;
       gap: 2px;
     }
-    .det-field strong {
+    .m-field strong {
       color: #94a3b8;
-      font-size: 0.76rem;
+      font-size: 0.75rem;
     }
 
     tbody td {
@@ -822,35 +850,40 @@
       </table>
     </div>
 
-    <!-- Process Details Section (Requisitos 3 & 4) -->
-    <div id="detailsSection" class="details-section" onclick="focusSelectedProcess()" title="Clique neste painel para focar a janela do aplicativo">
-      <div class="details-header">
-        <div class="details-title" id="detTitle">📋 DETALHES DO PROCESSO SELECIONADO</div>
-        <button id="detBtnFocus" class="btn-det-focus">🎯 Clique aqui para abrir a janela do aplicativo</button>
-      </div>
-      <div class="details-subtitle" id="detSubtitle">💡 Clique em qualquer lugar deste painel para alternar o foco para o aplicativo selecionado</div>
-      <div class="details-grid">
-        <div class="det-card">
-          <div class="det-card-title" style="color: #fbbf24;">📌 IDENTIFICAÇÃO & STATUS</div>
-          <div class="det-field"><strong>Aplicação:</strong> <span id="detFriendly">--</span></div>
-          <div class="det-field"><strong>Executável:</strong> <span id="detBin">--</span></div>
-          <div class="det-field"><strong>Categoria:</strong> <span id="detCat">--</span></div>
-          <div class="det-field"><strong>Status:</strong> <span id="detStatus">--</span></div>
-          <div class="det-field"><strong>Motivo:</strong> <span id="detReason">--</span></div>
+    <!-- Modal Subwindow Overlay (Requisito: Subjanela sobre a janela principal) -->
+    <div id="detailModalOverlay" class="modal-overlay" onclick="closeModalOnBackdrop(event)">
+      <div class="modal-card" onclick="focusAndCloseModal()">
+        <div class="modal-header">
+          <div class="modal-title" id="mTitle">📋 DETALHES DO PROCESSO</div>
+          <button class="modal-close-btn" onclick="closeModal(event)" title="Fechar (ESC)">✕</button>
         </div>
-        <div class="det-card">
-          <div class="det-card-title" style="color: #4ade80;">⚡ RECURSOS DO SISTEMA</div>
-          <div class="det-field"><strong>Consumo de CPU:</strong> <span id="detCpu" style="color:#38bdf8; font-weight:bold;">--</span></div>
-          <div class="det-field"><strong>Memória RAM:</strong> <span id="detMem">--</span></div>
-          <div class="det-field"><strong>Pico de Memória:</strong> <span id="detPeak">--</span></div>
-          <div class="det-field"><strong>Threads / Prioridade:</strong> <span id="detThreads">--</span></div>
-          <div class="det-field"><strong>Tempo Ativo:</strong> <span id="detUptime">--</span></div>
+        <div id="mBanner" class="modal-banner">
+          <span id="mBannerText">🎯 CLIQUE AQUI (OU EM QUALQUER LUGAR) PARA ABRIR A JANELA DO APLICATIVO</span>
         </div>
-        <div class="det-card">
-          <div class="det-card-title" style="color: #c084fc;">🪟 JANELA & COMANDO</div>
-          <div class="det-field"><strong>Título da Janela:</strong> <span id="detWin">--</span></div>
-          <div class="det-field"><strong>Caminho:</strong> <span id="detPath" style="word-break:break-all;">--</span></div>
-          <div class="det-field"><strong>Comando:</strong> <span id="detCmd" style="word-break:break-all; color:#94a3b8;">--</span></div>
+        <div class="modal-hint">💡 Ao clicar nesta subjanela, o foco muda para o aplicativo e a janela fecha automaticamente.</div>
+        <div class="modal-grid">
+          <div class="m-card">
+            <div class="m-card-title" style="color: #fbbf24;">📌 IDENTIFICAÇÃO & STATUS</div>
+            <div class="m-field"><strong>Aplicação:</strong> <span id="mFriendly">--</span></div>
+            <div class="m-field"><strong>Executável:</strong> <span id="mBin">--</span></div>
+            <div class="m-field"><strong>Categoria:</strong> <span id="mCat">--</span></div>
+            <div class="m-field"><strong>Status:</strong> <span id="mStatus">--</span></div>
+            <div class="m-field"><strong>Motivo:</strong> <span id="mReason">--</span></div>
+          </div>
+          <div class="m-card">
+            <div class="m-card-title" style="color: #4ade80;">⚡ RECURSOS DO SISTEMA</div>
+            <div class="m-field"><strong>Consumo de CPU:</strong> <span id="mCpu" style="color:#38bdf8; font-weight:bold;">--</span></div>
+            <div class="m-field"><strong>Memória RAM:</strong> <span id="mMem">--</span></div>
+            <div class="m-field"><strong>Pico de Memória:</strong> <span id="mPeak">--</span></div>
+            <div class="m-field"><strong>Threads / Prioridade:</strong> <span id="mThreads">--</span></div>
+            <div class="m-field"><strong>Tempo Ativo:</strong> <span id="mUptime">--</span></div>
+          </div>
+          <div class="m-card">
+            <div class="m-card-title" style="color: #c084fc;">🪟 JANELA & COMANDO</div>
+            <div class="m-field"><strong>Título da Janela:</strong> <span id="mWin">--</span></div>
+            <div class="m-field"><strong>Caminho:</strong> <span id="mPath" style="word-break:break-all;">--</span></div>
+            <div class="m-field"><strong>Comando:</strong> <span id="mCmd" style="word-break:break-all; color:#94a3b8;">--</span></div>
+          </div>
         </div>
       </div>
     </div>
@@ -863,7 +896,7 @@
 
     <!-- Footer -->
     <footer>
-      <span>AI Process Monitor v1.3.0 • Dica: Clique no processo para ver detalhes e na tela de detalhes para focar</span>
+      <span>AI Process Monitor v1.3.0 • Dica: Clique em qualquer processo para abrir a subjanela de detalhes</span>
       <span id="lastUpdatedLabel">Última checagem: --</span>
     </footer>
   </div>
@@ -1048,7 +1081,9 @@
         ? `${(totalMem / 1024).toFixed(2)} GB` 
         : `${totalMem.toFixed(1)} MB`;
 
-      renderDetails();
+      if (currentModalPid) {
+        renderModalDetails(currentModalPid);
+      }
     }
 
     let repeatingAudioTimer = null;
@@ -1066,57 +1101,75 @@
       }
     }
 
-    let selectedPid = null;
+    let currentModalPid = null;
 
+    // Requisito: A subjanela aparece apenas quando seleciona o processo
     function selectProcess(pid) {
-      selectedPid = pid;
-      renderTable();
-      renderDetails();
+      currentModalPid = pid;
+      renderModalDetails(pid);
+      document.getElementById('detailModalOverlay').classList.add('active');
     }
 
-    function focusSelectedProcess() {
-      if (!selectedPid && rawProcesses.length > 0) {
-        selectedPid = rawProcesses[0].pid;
-      }
-      if (!selectedPid) return;
-      const p = rawProcesses.find(x => x.pid === selectedPid);
-      if (p) focusWindow(p.pid, p.friendlyName);
+    function closeModal(e) {
+      if (e) e.stopPropagation();
+      document.getElementById('detailModalOverlay').classList.remove('active');
+      currentModalPid = null;
     }
 
-    function renderDetails() {
-      if (!selectedPid && rawProcesses.length > 0) {
-        selectedPid = rawProcesses[0].pid;
+    function closeModalOnBackdrop(e) {
+      if (e.target.id === 'detailModalOverlay') {
+        closeModal();
       }
-      const p = rawProcesses.find(x => x.pid === selectedPid);
+    }
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        closeModal();
+      }
+    });
+
+    // Requisito: Se clicar na subjanela, muda o foco para o processo e fecha a subjanela
+    function focusAndCloseModal() {
+      if (!currentModalPid) return;
+      const p = rawProcesses.find(x => x.pid === currentModalPid);
+      if (p) {
+        focusWindow(p.pid, p.friendlyName);
+      }
+      closeModal();
+    }
+
+    function renderModalDetails(pid) {
+      const p = rawProcesses.find(x => x.pid === pid);
       if (!p) return;
 
-      document.getElementById('detTitle').textContent = `📋 DETALHES DO PROCESSO: ${p.friendlyName} (PID ${p.pid})`;
-      document.getElementById('detFriendly').textContent = p.friendlyName;
-      document.getElementById('detBin').textContent = `${p.processName}.exe (PID ${p.pid})`;
-      document.getElementById('detCat').textContent = p.category || '--';
-      
-      const statusEl = document.getElementById('detStatus');
+      document.getElementById('mTitle').textContent = `📋 DETALHES DO PROCESSO: ${p.friendlyName} (PID ${p.pid})`;
+      document.getElementById('mFriendly').textContent = p.friendlyName;
+      document.getElementById('mBin').textContent = `${p.processName}.exe (PID ${p.pid})`;
+      document.getElementById('mCat').textContent = p.category || '--';
+
+      const statusEl = document.getElementById('mStatus');
       statusEl.textContent = p.needsHumanInput ? '🔴 AGUARDANDO AÇÃO HUMANA' : '🟢 Em Execução / Ativo';
       statusEl.style.color = p.needsHumanInput ? '#f87171' : '#4ade80';
       statusEl.style.fontWeight = 'bold';
-      
-      document.getElementById('detReason').textContent = p.statusReason || '--';
-      document.getElementById('detCpu').textContent = `${(p.cpuPercent || 0).toFixed(1)} %`;
-      document.getElementById('detMem').textContent = `${(p.memoryMB || 0).toFixed(1)} MB`;
-      document.getElementById('detPeak').textContent = p.peakMemoryMB ? `${p.peakMemoryMB.toFixed(1)} MB` : '--';
-      document.getElementById('detThreads').textContent = `${p.threadsCount || '--'} | Prioridade: ${p.priority || 'Normal'}`;
-      document.getElementById('detUptime').textContent = `${formatUptime(p.uptimeSeconds)} (Início: ${p.startTime || '--'})`;
-      document.getElementById('detWin').textContent = p.windowTitle || '(Nenhuma janela visível direta)';
-      document.getElementById('detPath').textContent = p.executablePath || '--';
-      document.getElementById('detCmd').textContent = p.commandLine || '--';
 
-      const btn = document.getElementById('detBtnFocus');
+      document.getElementById('mReason').textContent = p.statusReason || '--';
+      document.getElementById('mCpu').textContent = `${(p.cpuPercent || 0).toFixed(1)} %`;
+      document.getElementById('mMem').textContent = `${(p.memoryMB || 0).toFixed(1)} MB`;
+      document.getElementById('mPeak').textContent = p.peakMemoryMB ? `${p.peakMemoryMB.toFixed(1)} MB` : '--';
+      document.getElementById('mThreads').textContent = `${p.threadsCount || '--'} | Prioridade: ${p.priority || 'Normal'}`;
+      document.getElementById('mUptime').textContent = `${formatUptime(p.uptimeSeconds)} (Início: ${p.startTime || '--'})`;
+      document.getElementById('mWin').textContent = p.windowTitle || '(Nenhuma janela visível direta)';
+      document.getElementById('mPath').textContent = p.executablePath || '--';
+      document.getElementById('mCmd').textContent = p.commandLine || '--';
+
+      const banner = document.getElementById('mBanner');
+      const bannerText = document.getElementById('mBannerText');
       if (p.needsHumanInput) {
-        btn.className = 'btn-det-focus alert';
-        btn.textContent = '🚨 CLIQUE AQUI PARA ABRIR A JANELA E INTERVIR';
+        banner.className = 'modal-banner alert';
+        bannerText.textContent = '🚨 AÇÃO HUMANA NECESSÁRIA • CLIQUE AQUI PARA ABRIR A JANELA DO APLICATIVO';
       } else {
-        btn.className = 'btn-det-focus';
-        btn.textContent = '🎯 CLIQUE AQUI PARA ABRIR A JANELA DO APLICATIVO';
+        banner.className = 'modal-banner';
+        bannerText.textContent = '🎯 CLIQUE AQUI (OU EM QUALQUER LUGAR) PARA ABRIR A JANELA DO APLICATIVO';
       }
     }
 
