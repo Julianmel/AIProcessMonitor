@@ -725,11 +725,17 @@
       <div class="brand">
         <div class="brand-icon">⚡</div>
         <div>
-          <h1>AI Process Monitor <span style="font-size: 0.75rem; background: #334155; color: #38bdf8; padding: 2px 8px; border-radius: 9999px; margin-left: 6px; vertical-align: middle;">v1.6.0</span></h1>
-          <p>Painel em tempo real • Clique no processo para ver detalhes e na tela de detalhes para focar</p>
+          <h1>AI Process Monitor <span style="font-size: 0.75rem; background: #334155; color: #38bdf8; padding: 2px 8px; border-radius: 9999px; margin-left: 6px; vertical-align: middle;">v1.7.0</span></h1>
+          <p>Painel em tempo real • Suporte a Celular/Wi-Fi • Detecção Heurística de IA</p>
         </div>
       </div>
       <div class="header-actions">
+        <button id="btnMobileConnect" class="btn btn-primary" onclick="openQrModal()" title="Conectar smartphone no mesmo Wi-Fi via QR Code" style="display: inline-flex; align-items: center; gap: 6px;">
+          📱 Celular (QR)
+        </button>
+        <button id="btnMobileAudio" class="btn btn-secondary" onclick="enableMobileAudio()" title="Ativar alarme sonoro e vibração contínua no celular" style="display: inline-flex; align-items: center; gap: 6px;">
+          🔊 Alarme Celular: Off
+        </button>
         <a href="/api/history" target="_blank" class="btn btn-secondary" title="Consultar histórico de alertas via API">
           📋 Histórico
         </a>
@@ -739,9 +745,6 @@
         <a href="/api/export?format=csv" download class="btn btn-secondary" title="Exportar processos em CSV">
           📊 CSV
         </a>
-        <button class="btn btn-secondary" onclick="testSoundAlert()" title="Testar som de notificação">
-          🔔 Testar Som
-        </button>
         <a href="/api/processes" target="_blank" class="api-badge" title="JSON da API">
           <span>GET /api/processes</span> ↗
         </a>
@@ -897,6 +900,36 @@
       </div>
     </div>
 
+    <!-- QR Code Modal (Fase 4) -->
+    <div id="qrModal" class="modal-overlay" onclick="closeModalOnBackdrop(event)">
+      <div class="modal-card" style="max-width: 440px; text-align: center; cursor: default;" onclick="event.stopPropagation()">
+        <div class="modal-header">
+          <h2 class="modal-title" style="display: flex; align-items: center; gap: 8px;">📱 Conectar Celular / Wi-Fi</h2>
+          <button class="modal-close-btn" onclick="closeQrModal()">&times;</button>
+        </div>
+        <p style="font-size: 0.84rem; color: var(--text-muted); margin: 6px 0 12px 0;">
+          Aponte a câmera do seu smartphone (na mesma rede Wi-Fi) para abrir o painel com áudio e vibração:
+        </p>
+        <div style="background: white; padding: 14px; border-radius: 12px; display: inline-block; margin: 0 auto; box-shadow: 0 4px 20px rgba(0,0,0,0.4);">
+          <img id="qrModalImg" src="/api/qr" alt="QR Code de Acesso" width="220" height="220" style="display: block; border-radius: 4px;">
+        </div>
+        <div style="margin-top: 14px; background: #1e293b; border: 1px solid var(--card-border); padding: 10px 14px; border-radius: 8px; font-family: monospace; font-size: 0.95rem; color: #38bdf8; word-break: break-all;" id="lanUrlDisplay">
+          Carregando endereço da rede...
+        </div>
+        <div style="display: flex; justify-content: center; gap: 10px; margin-top: 14px;">
+          <button class="btn btn-primary" id="btnCopyLan" onclick="copyLanUrl()" style="padding: 8px 18px;">
+            📋 Copiar URL
+          </button>
+          <button class="btn btn-secondary" onclick="closeQrModal()" style="padding: 8px 18px;">
+            Fechar
+          </button>
+        </div>
+        <div style="margin-top: 10px; font-size: 0.78rem; color: #94a3b8;">
+          💡 Dica: No celular, toque no botão <strong>"🔊 Alarme Celular"</strong> para receber sons e vibração no bolso.
+        </div>
+      </div>
+    </div>
+
     <!-- Toast Notification -->
     <div id="toast" class="toast">
       <span id="toastIcon">🎯</span>
@@ -905,7 +938,7 @@
 
     <!-- Footer -->
     <footer>
-      <span>AI Process Monitor v1.6.0 • Dica: Clique em qualquer processo para abrir a subjanela de detalhes</span>
+      <span>AI Process Monitor v1.7.0 • Suporte Móvel & Alerta Sonoro Remoto • Dica: Clique no processo para ver detalhes</span>
       <span id="lastUpdatedLabel">Última checagem: --</span>
     </footer>
   </div>
@@ -919,23 +952,116 @@
     let rawProcesses = [];
     let previousAlertPids = new Set();
 
-    // Audio Alert using Web Audio API (Zero external assets)
+    // Audio & Mobile Vibration Support (Web Audio API & Vibration API)
+    let persistentAudioCtx = null;
+    let mobileAudioEnabled = false;
+
+    function initAudioContext() {
+      try {
+        if (!persistentAudioCtx) {
+          persistentAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (persistentAudioCtx.state === 'suspended') {
+          persistentAudioCtx.resume();
+        }
+      } catch (e) {
+        console.warn("Falha ao inicializar AudioContext:", e);
+      }
+    }
+
+    function enableMobileAudio() {
+      initAudioContext();
+      mobileAudioEnabled = !mobileAudioEnabled;
+      const btn = document.getElementById('btnMobileAudio');
+      if (btn) {
+        if (mobileAudioEnabled) {
+          btn.textContent = '🔊 Alarme Celular: ATIVO';
+          btn.style.background = '#10b981';
+          btn.style.color = '#ffffff';
+          btn.style.borderColor = '#34d399';
+          playAlertChime();
+          showToast("🔊 Alarme sonoro e vibração ativados no celular!", "📱");
+        } else {
+          btn.textContent = '🔊 Alarme Celular: Off';
+          btn.style.background = '';
+          btn.style.color = '';
+          btn.style.borderColor = '';
+          showToast("🔇 Alarme remoto no celular desativado", "🔕");
+        }
+      }
+    }
+
     function playAlertChime() {
       try {
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        initAudioContext();
+        if (!persistentAudioCtx) return;
+        const ctx = persistentAudioCtx;
         const osc = ctx.createOscillator();
         const gain = ctx.createGain();
+
+        // 2-tone melodic chime (D5 -> A5)
         osc.type = 'sine';
         osc.frequency.setValueAtTime(587.33, ctx.currentTime); // D5
         osc.frequency.setValueAtTime(880, ctx.currentTime + 0.15); // A5
-        gain.gain.setValueAtTime(0.15, ctx.currentTime);
-        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.4);
+
+        gain.gain.setValueAtTime(0.25, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.45);
+
         osc.connect(gain);
         gain.connect(ctx.destination);
+
         osc.start();
-        osc.stop(ctx.currentTime + 0.4);
+        osc.stop(ctx.currentTime + 0.45);
+
+        // Hardware Vibration on Mobile Devices
+        if (navigator.vibrate) {
+          navigator.vibrate([200, 100, 200]);
+        }
       } catch (e) {
-        console.warn("Audio Context blocked:", e);
+        console.warn("Audio Context bloqueado pelo navegador:", e);
+      }
+    }
+
+    function openQrModal() {
+      const modal = document.getElementById('qrModal');
+      if (!modal) return;
+      modal.classList.add('active');
+
+      const urlEl = document.getElementById('lanUrlDisplay');
+      const qrImg = document.getElementById('qrModalImg');
+
+      fetch('/api/network')
+        .then(res => res.json())
+        .then(data => {
+          if (data && data.url) {
+            urlEl.textContent = data.url;
+            qrImg.src = '/api/qr?t=' + Date.now();
+          } else {
+            urlEl.textContent = window.location.origin;
+          }
+        })
+        .catch(() => {
+          urlEl.textContent = window.location.origin;
+        });
+    }
+
+    function closeQrModal() {
+      const modal = document.getElementById('qrModal');
+      if (modal) modal.classList.remove('active');
+    }
+
+    function copyLanUrl() {
+      const el = document.getElementById('lanUrlDisplay');
+      const text = el ? el.textContent.trim() : '';
+      if (navigator.clipboard && text) {
+        navigator.clipboard.writeText(text).then(() => {
+          const btn = document.getElementById('btnCopyLan');
+          if (btn) {
+            btn.textContent = '✅ Copiado!';
+            setTimeout(() => { btn.textContent = '📋 Copiar URL'; }, 2000);
+          }
+          showToast("Endereço copiado para a área de transferência!", "📋");
+        });
       }
     }
 

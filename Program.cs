@@ -3,10 +3,12 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
 using System.Management;
 using System.Net;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Speech.Synthesis;
@@ -15,15 +17,16 @@ using System.Threading;
 using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
+using QRCoder;
 
 [assembly: AssemblyTitle("AI Process Monitor")]
 [assembly: AssemblyDescription("Monitor de Processos de IA e Ação Humana em Tempo Real")]
 [assembly: AssemblyCompany("Julianmel")]
 [assembly: AssemblyProduct("AI Process Monitor")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("1.6.0.0")]
-[assembly: AssemblyFileVersion("1.6.0.0")]
-[assembly: AssemblyInformationalVersion("1.6.0")]
+[assembly: AssemblyVersion("1.7.0.0")]
+[assembly: AssemblyFileVersion("1.7.0.0")]
+[assembly: AssemblyInformationalVersion("1.7.0")]
 
 namespace AIProcessMonitor
 {
@@ -197,18 +200,26 @@ namespace AIProcessMonitor
     }
     #endregion
 
-    #region Configuration & Webhook Notification Manager
+    #region Configuration & Preferences Manager
     public class AppConfig
     {
         public string WebhookUrl { get; set; }
         public bool WebhookEnabled { get; set; }
         public int WebhookCooldownSec { get; set; }
+        public string SoundMode { get; set; } // "VoiceMaria", "Beep", "Silent"
+        public int AlertIntervalSec { get; set; } // 2, 4, 8, 15 (default 4)
+        public bool TrayNotificationsEnabled { get; set; }
+        public List<string> CustomProcessNames { get; set; }
 
         public AppConfig()
         {
             WebhookUrl = "";
             WebhookEnabled = false;
             WebhookCooldownSec = 60;
+            SoundMode = "VoiceMaria";
+            AlertIntervalSec = 4;
+            TrayNotificationsEnabled = true;
+            CustomProcessNames = new List<string>();
         }
     }
 
@@ -245,6 +256,9 @@ namespace AIProcessMonitor
                         string json = File.ReadAllText(ConfigPath, Encoding.UTF8);
                         var ser = new JavaScriptSerializer();
                         currentConfig = ser.Deserialize<AppConfig>(json) ?? new AppConfig();
+                        if (currentConfig.CustomProcessNames == null) currentConfig.CustomProcessNames = new List<string>();
+                        if (string.IsNullOrEmpty(currentConfig.SoundMode)) currentConfig.SoundMode = "VoiceMaria";
+                        if (currentConfig.AlertIntervalSec <= 0) currentConfig.AlertIntervalSec = 4;
                         return currentConfig;
                     }
                 }
@@ -578,11 +592,12 @@ namespace AIProcessMonitor
 
     public static class Program
     {
-        public const string AppVersion = "1.6.0";
-        public const string BuildDate = "2026-09-13";
+        public const string AppVersion = "1.7.0";
+        public const string BuildDate = "2026-09-14";
 
         public static int port = 3333;
-        private static HttpListener listener;
+        public static string LocalIp = "127.0.0.1";
+        private static TcpListener tcpServer;
         private static string embeddedHtml = null;
         private static readonly object cacheLock = new object();
         private static string cachedJson = null;
@@ -697,6 +712,22 @@ namespace AIProcessMonitor
         [STAThread]
         static void Main(string[] args)
         {
+            AppDomain.CurrentDomain.AssemblyResolve += (sender, eventArgs) =>
+            {
+                try
+                {
+                    string resName = new AssemblyName(eventArgs.Name).Name + ".dll";
+                    using (var s = Assembly.GetExecutingAssembly().GetManifestResourceStream(resName))
+                    {
+                        if (s == null) return null;
+                        byte[] d = new byte[s.Length];
+                        s.Read(d, 0, d.Length);
+                        return Assembly.Load(d);
+                    }
+                }
+                catch { return null; }
+            };
+
             LoadEmbeddedHtml();
 
             int customPort;
@@ -722,7 +753,7 @@ namespace AIProcessMonitor
                 var exitEvent = new ManualResetEvent(false);
                 Console.CancelKeyPress += (s, e) => { e.Cancel = true; exitEvent.Set(); };
                 exitEvent.WaitOne();
-                try { if (listener != null) listener.Stop(); } catch { }
+                try { if (tcpServer != null) tcpServer.Stop(); } catch { }
             }
             else
             {
@@ -779,19 +810,72 @@ namespace AIProcessMonitor
             }
         }
 
+        #region Network IP & QR Code Generation (Fase 4)
+        public static string GetLocalIpAddress()
+        {
+            try
+            {
+                using (var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, 0))
+                {
+                    socket.Connect("8.8.8.8", 65530);
+                    var ep = socket.LocalEndPoint as IPEndPoint;
+                    if (ep != null) return ep.Address.ToString();
+                }
+            }
+            catch { }
+
+            try
+            {
+                var host = Dns.GetHostEntry(Dns.GetHostName());
+                foreach (var ip in host.AddressList)
+                {
+                    if (ip.AddressFamily == AddressFamily.InterNetwork &&
+                        !IPAddress.IsLoopback(ip) &&
+                        !ip.ToString().StartsWith("169.254."))
+                    {
+                        return ip.ToString();
+                    }
+                }
+            }
+            catch { }
+
+            return "127.0.0.1";
+        }
+
+        public static Bitmap GenerateQrCodeBitmap(string text, int pixelsPerModule = 8)
+        {
+            using (var qrGen = new QRCodeGenerator())
+            using (var qrData = qrGen.CreateQrCode(text, QRCodeGenerator.ECCLevel.M))
+            using (var qrCode = new QRCode(qrData))
+            {
+                return qrCode.GetGraphic(pixelsPerModule, Color.Black, Color.White, true);
+            }
+        }
+
+        public static byte[] GenerateQrCodePng(string text, int pixelsPerModule = 8)
+        {
+            using (var bmp = GenerateQrCodeBitmap(text, pixelsPerModule))
+            using (var ms = new MemoryStream())
+            {
+                bmp.Save(ms, ImageFormat.Png);
+                return ms.ToArray();
+            }
+        }
+        #endregion
+
         private static void StartServer()
         {
+            LocalIp = GetLocalIpAddress();
             bool started = false;
             while (!started && port < 3400)
             {
                 try
                 {
-                    listener = new HttpListener();
-                    listener.Prefixes.Add("http://localhost:" + port + "/");
-                    listener.Start();
+                    tcpServer = new TcpListener(IPAddress.Any, port);
+                    tcpServer.Start();
                     started = true;
                 }
-                catch (HttpListenerException)
+                catch
                 {
                     port++;
                 }
@@ -805,307 +889,403 @@ namespace AIProcessMonitor
 
         private static void ListenLoop(object state)
         {
-            while (listener != null && listener.IsListening)
+            while (tcpServer != null)
             {
                 try
                 {
-                    var ctx = listener.GetContext();
-                    ThreadPool.QueueUserWorkItem(ProcessRequest, ctx);
+                    var client = tcpServer.AcceptTcpClient();
+                    ThreadPool.QueueUserWorkItem(c => HandleClientConnection((TcpClient)c), client);
                 }
                 catch
                 {
-                    if (listener == null || !listener.IsListening) break;
+                    break;
                 }
             }
         }
 
-        private static void ProcessRequest(object state)
+        private static void HandleClientConnection(TcpClient client)
         {
-            var ctx = (HttpListenerContext)state;
-            var req = ctx.Request;
-            var res = ctx.Response;
-
-            res.Headers.Add("Access-Control-Allow-Origin", "*");
-            res.Headers.Add("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            res.Headers.Add("Access-Control-Allow-Headers", "Content-Type");
-
-            if (req.HttpMethod == "OPTIONS")
-            {
-                res.StatusCode = 204;
-                res.Close();
-                return;
-            }
-
             try
             {
-                string path = req.Url.AbsolutePath;
-
-                if (path == "/" || path == "/index.html")
+                client.ReceiveTimeout = 6000;
+                client.SendTimeout = 6000;
+                using (client)
+                using (var stream = client.GetStream())
                 {
-                    byte[] buf = Encoding.UTF8.GetBytes(embeddedHtml);
-                    res.ContentType = "text/html; charset=utf-8";
-                    res.ContentLength64 = buf.Length;
-                    res.OutputStream.Write(buf, 0, buf.Length);
-                    res.Close();
-                    return;
-                }
+                    var buffer = new byte[8192];
+                    int read = stream.Read(buffer, 0, buffer.Length);
+                    if (read <= 0) return;
 
-                if (path == "/api/processes")
-                {
-                    string json = GetProcessesJson();
-                    byte[] buf = Encoding.UTF8.GetBytes(json);
-                    res.ContentType = "application/json; charset=utf-8";
-                    res.ContentLength64 = buf.Length;
-                    res.OutputStream.Write(buf, 0, buf.Length);
-                    res.Close();
-                    return;
-                }
+                    string raw = Encoding.UTF8.GetString(buffer, 0, read);
+                    int firstLineEnd = raw.IndexOf("\r\n");
+                    if (firstLineEnd < 0) firstLineEnd = raw.IndexOf("\n");
+                    if (firstLineEnd < 0) return;
 
-                if (path == "/api/focus")
-                {
-                    string pidStr = req.QueryString["pid"];
-                    int pidToFocus;
-                    bool success = false;
-                    string message = "PID inválido";
+                    string reqLine = raw.Substring(0, firstLineEnd).Trim();
+                    string[] parts = reqLine.Split(' ');
+                    if (parts.Length < 2) return;
 
-                    if (int.TryParse(pidStr, out pidToFocus))
+                    string method = parts[0].ToUpperInvariant();
+                    string urlStr = parts[1];
+
+                    string path = urlStr;
+                    string query = "";
+                    int qIdx = urlStr.IndexOf('?');
+                    if (qIdx >= 0)
                     {
-                        success = FocusProcessWindow(pidToFocus, out message);
+                        path = urlStr.Substring(0, qIdx);
+                        query = urlStr.Substring(qIdx + 1);
                     }
 
-                    var ser = new JavaScriptSerializer();
-                    string json = ser.Serialize(new
+                    var queryParams = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                    if (!string.IsNullOrEmpty(query))
                     {
-                        success = success,
-                        pid = pidToFocus,
-                        message = message,
-                        version = AppVersion
-                    });
-
-                    byte[] buf = Encoding.UTF8.GetBytes(json);
-                    res.ContentType = "application/json; charset=utf-8";
-                    res.ContentLength64 = buf.Length;
-                    res.OutputStream.Write(buf, 0, buf.Length);
-                    res.Close();
-                    return;
-                }
-
-                if (path == "/api/kill")
-                {
-                    string pidStr = req.QueryString["pid"];
-                    int pidToKill;
-                    bool success = false;
-                    string message = "PID inválido";
-
-                    if (int.TryParse(pidStr, out pidToKill))
-                    {
-                        try
+                        string[] pairs = query.Split('&');
+                        foreach (var pair in pairs)
                         {
-                            var proc = Process.GetProcessById(pidToKill);
-                            proc.Kill();
-                            success = true;
-                            message = "Processo finalizado com sucesso.";
-                        }
-                        catch (Exception ex)
-                        {
-                            message = "Erro ao finalizar processo: " + ex.Message;
+                            int eq = pair.IndexOf('=');
+                            if (eq >= 0)
+                            {
+                                string k = Uri.UnescapeDataString(pair.Substring(0, eq));
+                                string v = Uri.UnescapeDataString(pair.Substring(eq + 1));
+                                queryParams[k] = v;
+                            }
+                            else
+                            {
+                                queryParams[Uri.UnescapeDataString(pair)] = "";
+                            }
                         }
                     }
 
-                    var ser = new JavaScriptSerializer();
-                    string json = ser.Serialize(new
+                    if (method == "OPTIONS")
                     {
-                        success = success,
-                        pid = pidToKill,
-                        message = message
-                    });
-
-                    byte[] buf = Encoding.UTF8.GetBytes(json);
-                    res.ContentType = "application/json; charset=utf-8";
-                    res.ContentLength64 = buf.Length;
-                    res.OutputStream.Write(buf, 0, buf.Length);
-                    res.Close();
-                    return;
-                }
-
-                if (path == "/api/export")
-                {
-                    string fmt = req.QueryString["format"] ?? "json";
-                    var list = ScanProcesses();
-                    if (fmt.ToLowerInvariant() == "csv")
-                    {
-                        var sb = new StringBuilder();
-                        sb.AppendLine("PID,FriendlyName,ProcessName,Category,CpuPercent,MemoryMB,NeedsHumanInput,StatusReason,WindowTitle,Uptime");
-                        foreach (var p in list)
-                        {
-                            sb.AppendLine(string.Format("\"{0}\",\"{1}\",\"{2}\",\"{3}\",\"{4:0.0}\",\"{5:0.0}\",\"{6}\",\"{7}\",\"{8}\",\"{9}\"",
-                                p.pid,
-                                (p.friendlyName ?? "").Replace("\"", "\"\""),
-                                (p.processName ?? "").Replace("\"", "\"\""),
-                                (p.category ?? "").Replace("\"", "\"\""),
-                                p.cpuPercent,
-                                p.memoryMB,
-                                p.needsHumanInput,
-                                (p.statusReason ?? "").Replace("\"", "\"\""),
-                                (p.windowTitle ?? "").Replace("\"", "\"\""),
-                                (p.uptimeHuman ?? "").Replace("\"", "\"\"")
-                            ));
-                        }
-                        byte[] buf = Encoding.UTF8.GetBytes(sb.ToString());
-                        res.ContentType = "text/csv; charset=utf-8";
-                        res.AddHeader("Content-Disposition", "attachment; filename=\"ai_processes_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".csv\"");
-                        res.ContentLength64 = buf.Length;
-                        res.OutputStream.Write(buf, 0, buf.Length);
-                        res.Close();
+                        SendHttpResponse(stream, 204, "text/plain", new byte[0]);
                         return;
                     }
-                    else
+
+                    if (path == "/" || path == "/index.html")
                     {
+                        byte[] buf = Encoding.UTF8.GetBytes(embeddedHtml);
+                        SendHttpResponse(stream, 200, "text/html; charset=utf-8", buf);
+                        return;
+                    }
+
+                    if (path == "/api/processes")
+                    {
+                        string json = GetProcessesJson();
+                        byte[] buf = Encoding.UTF8.GetBytes(json);
+                        SendHttpResponse(stream, 200, "application/json; charset=utf-8", buf);
+                        return;
+                    }
+
+                    if (path == "/api/network")
+                    {
+                        var ser = new JavaScriptSerializer();
+                        string localUrl = "http://" + LocalIp + ":" + port;
+                        string json = ser.Serialize(new
+                        {
+                            ip = LocalIp,
+                            port = port,
+                            url = localUrl,
+                            localhost = "http://localhost:" + port
+                        });
+                        byte[] buf = Encoding.UTF8.GetBytes(json);
+                        SendHttpResponse(stream, 200, "application/json; charset=utf-8", buf);
+                        return;
+                    }
+
+                    if (path == "/api/qr")
+                    {
+                        string urlToEncode = "http://" + LocalIp + ":" + port;
+                        byte[] qrBytes = GenerateQrCodePng(urlToEncode, 8);
+                        SendHttpResponse(stream, 200, "image/png", qrBytes);
+                        return;
+                    }
+
+                    if (path == "/api/focus")
+                    {
+                        string pidStr;
+                        queryParams.TryGetValue("pid", out pidStr);
+                        int pidToFocus;
+                        bool success = false;
+                        string message = "PID inválido";
+
+                        if (int.TryParse(pidStr, out pidToFocus))
+                        {
+                            success = FocusProcessWindow(pidToFocus, out message);
+                        }
+
+                        var ser = new JavaScriptSerializer();
+                        string json = ser.Serialize(new
+                        {
+                            success = success,
+                            pid = pidToFocus,
+                            message = message,
+                            version = AppVersion
+                        });
+
+                        byte[] buf = Encoding.UTF8.GetBytes(json);
+                        SendHttpResponse(stream, 200, "application/json; charset=utf-8", buf);
+                        return;
+                    }
+
+                    if (path == "/api/kill")
+                    {
+                        string pidStr;
+                        queryParams.TryGetValue("pid", out pidStr);
+                        int pidToKill;
+                        bool success = false;
+                        string message = "PID inválido";
+
+                        if (int.TryParse(pidStr, out pidToKill))
+                        {
+                            try
+                            {
+                                var proc = Process.GetProcessById(pidToKill);
+                                proc.Kill();
+                                success = true;
+                                message = "Processo finalizado com sucesso.";
+                            }
+                            catch (Exception ex)
+                            {
+                                message = "Erro ao finalizar processo: " + ex.Message;
+                            }
+                        }
+
+                        var ser = new JavaScriptSerializer();
+                        string json = ser.Serialize(new
+                        {
+                            success = success,
+                            pid = pidToKill,
+                            message = message
+                        });
+
+                        byte[] buf = Encoding.UTF8.GetBytes(json);
+                        SendHttpResponse(stream, 200, "application/json; charset=utf-8", buf);
+                        return;
+                    }
+
+                    if (path == "/api/mute")
+                    {
+                        string duration;
+                        queryParams.TryGetValue("duration", out duration);
+                        if (string.IsNullOrEmpty(duration)) queryParams.TryGetValue("mode", out duration);
+
+                        if (duration == "15m") MuteManager.MuteFor(TimeSpan.FromMinutes(15));
+                        else if (duration == "30m") MuteManager.MuteFor(TimeSpan.FromMinutes(30));
+                        else if (duration == "1h") MuteManager.MuteFor(TimeSpan.FromHours(1));
+                        else if (duration == "indefinite") MuteManager.MuteIndefinitely();
+                        else if (duration == "unmute") MuteManager.Unmute();
+
+                        var ser = new JavaScriptSerializer();
+                        string json = ser.Serialize(new
+                        {
+                            isMuted = MuteManager.IsMuted,
+                            isIndefinite = MuteManager.IsMutedIndefinitely,
+                            muteUntilUtc = MuteManager.MuteUntilUtc.ToString("o")
+                        });
+
+                        byte[] buf = Encoding.UTF8.GetBytes(json);
+                        SendHttpResponse(stream, 200, "application/json; charset=utf-8", buf);
+                        return;
+                    }
+
+                    if (path == "/api/export")
+                    {
+                        string fmt;
+                        queryParams.TryGetValue("format", out fmt);
+                        if (string.IsNullOrEmpty(fmt)) fmt = "json";
+
+                        var list = ScanProcesses();
+                        if (fmt.ToLowerInvariant() == "csv")
+                        {
+                            var sb = new StringBuilder();
+                            sb.AppendLine("PID,FriendlyName,ProcessName,Category,CpuPercent,MemoryMB,NeedsHumanInput,StatusReason,WindowTitle,Uptime");
+                            foreach (var p in list)
+                            {
+                                sb.AppendLine(string.Format("\"{0}\",\"{1}\",\"{2}\",\"{3}\",\"{4:0.0}\",\"{5:0.0}\",\"{6}\",\"{7}\",\"{8}\",\"{9}\"",
+                                    p.pid,
+                                    (p.friendlyName ?? "").Replace("\"", "\"\""),
+                                    (p.processName ?? "").Replace("\"", "\"\""),
+                                    (p.category ?? "").Replace("\"", "\"\""),
+                                    p.cpuPercent,
+                                    p.memoryMB,
+                                    p.needsHumanInput,
+                                    (p.statusReason ?? "").Replace("\"", "\"\""),
+                                    (p.windowTitle ?? "").Replace("\"", "\"\""),
+                                    (p.uptimeHuman ?? "").Replace("\"", "\"\"")
+                                ));
+                            }
+                            byte[] buf = Encoding.UTF8.GetBytes(sb.ToString());
+                            SendHttpResponse(stream, 200, "text/csv; charset=utf-8", buf,
+                                "attachment; filename=\"ai_processes_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".csv\"");
+                            return;
+                        }
+                        else
+                        {
+                            var ser = new JavaScriptSerializer();
+                            ser.MaxJsonLength = int.MaxValue;
+                            string json = ser.Serialize(new
+                            {
+                                version = AppVersion,
+                                exportedAt = DateTime.UtcNow.ToString("o"),
+                                count = list.Count,
+                                processes = list
+                            });
+                            byte[] buf = Encoding.UTF8.GetBytes(json);
+                            SendHttpResponse(stream, 200, "application/json; charset=utf-8", buf,
+                                "attachment; filename=\"ai_processes_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".json\"");
+                            return;
+                        }
+                    }
+
+                    if (path == "/api/health")
+                    {
+                        var ser = new JavaScriptSerializer();
+                        string json = ser.Serialize(new
+                        {
+                            status = "ok",
+                            version = AppVersion,
+                            buildDate = BuildDate,
+                            localIp = LocalIp,
+                            port = port,
+                            timestamp = DateTime.UtcNow.ToString("o")
+                        });
+
+                        byte[] buf = Encoding.UTF8.GetBytes(json);
+                        SendHttpResponse(stream, 200, "application/json; charset=utf-8", buf);
+                        return;
+                    }
+
+                    if (path == "/api/history")
+                    {
+                        var evs = AlertHistoryManager.GetEvents();
+                        var resolved = evs.Where(e => e.IsResolved && e.DurationSeconds.HasValue).ToList();
+                        double avgWait = resolved.Count > 0 ? Math.Round(resolved.Average(e => e.DurationSeconds.Value), 1) : 0.0;
+
                         var ser = new JavaScriptSerializer();
                         ser.MaxJsonLength = int.MaxValue;
                         string json = ser.Serialize(new
                         {
-                            version = AppVersion,
-                            exportedAt = DateTime.UtcNow.ToString("o"),
-                            count = list.Count,
-                            processes = list
+                            totalAlerts = evs.Count,
+                            resolvedAlerts = resolved.Count,
+                            averageResponseSeconds = avgWait,
+                            events = evs
                         });
+
                         byte[] buf = Encoding.UTF8.GetBytes(json);
-                        res.ContentType = "application/json; charset=utf-8";
-                        res.AddHeader("Content-Disposition", "attachment; filename=\"ai_processes_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".json\"");
-                        res.ContentLength64 = buf.Length;
-                        res.OutputStream.Write(buf, 0, buf.Length);
-                        res.Close();
+                        SendHttpResponse(stream, 200, "application/json; charset=utf-8", buf);
                         return;
                     }
-                }
 
-                if (path == "/api/health")
-                {
-                    var ser = new JavaScriptSerializer();
-                    string json = ser.Serialize(new
-                    {
-                        status = "ok",
-                        version = AppVersion,
-                        buildDate = BuildDate,
-                        timestamp = DateTime.UtcNow.ToString("o")
-                    });
-
-                    byte[] buf = Encoding.UTF8.GetBytes(json);
-                    res.ContentType = "application/json; charset=utf-8";
-                    res.ContentLength64 = buf.Length;
-                    res.OutputStream.Write(buf, 0, buf.Length);
-                    res.Close();
-                    return;
-                }
-
-                if (path == "/api/history")
-                {
-                    var evs = AlertHistoryManager.GetEvents();
-                    var resolved = evs.Where(e => e.IsResolved && e.DurationSeconds.HasValue).ToList();
-                    double avgWait = resolved.Count > 0 ? Math.Round(resolved.Average(e => e.DurationSeconds.Value), 1) : 0.0;
-
-                    var ser = new JavaScriptSerializer();
-                    ser.MaxJsonLength = int.MaxValue;
-                    string json = ser.Serialize(new
-                    {
-                        totalAlerts = evs.Count,
-                        resolvedAlerts = resolved.Count,
-                        averageResponseSeconds = avgWait,
-                        events = evs
-                    });
-
-                    byte[] buf = Encoding.UTF8.GetBytes(json);
-                    res.ContentType = "application/json; charset=utf-8";
-                    res.ContentLength64 = buf.Length;
-                    res.OutputStream.Write(buf, 0, buf.Length);
-                    res.Close();
-                    return;
-                }
-
-                if (path == "/api/config")
-                {
-                    var cfg = ConfigManager.GetConfig();
-                    if (req.HttpMethod == "POST")
-                    {
-                        string wUrl = req.QueryString["webhookUrl"];
-                        string wEnabled = req.QueryString["webhookEnabled"];
-                        if (wUrl != null) cfg.WebhookUrl = wUrl.Trim();
-                        if (wEnabled != null) cfg.WebhookEnabled = (wEnabled == "true" || wEnabled == "1");
-                        ConfigManager.SaveConfig(cfg);
-                    }
-
-                    var ser = new JavaScriptSerializer();
-                    string json = ser.Serialize(new
-                    {
-                        webhookUrl = cfg.WebhookUrl,
-                        webhookEnabled = cfg.WebhookEnabled,
-                        webhookCooldownSec = cfg.WebhookCooldownSec
-                    });
-
-                    byte[] buf = Encoding.UTF8.GetBytes(json);
-                    res.ContentType = "application/json; charset=utf-8";
-                    res.ContentLength64 = buf.Length;
-                    res.OutputStream.Write(buf, 0, buf.Length);
-                    res.Close();
-                    return;
-                }
-
-                if (path == "/api/webhook/test")
-                {
-                    string targetUrl = req.QueryString["url"];
-                    if (string.IsNullOrEmpty(targetUrl))
+                    if (path == "/api/config")
                     {
                         var cfg = ConfigManager.GetConfig();
-                        targetUrl = cfg.WebhookUrl;
+                        if (method == "POST")
+                        {
+                            string wUrl;
+                            queryParams.TryGetValue("webhookUrl", out wUrl);
+                            string wEnabled;
+                            queryParams.TryGetValue("webhookEnabled", out wEnabled);
+                            string sMode;
+                            queryParams.TryGetValue("soundMode", out sMode);
+                            string intervalStr;
+                            queryParams.TryGetValue("alertInterval", out intervalStr);
+
+                            if (wUrl != null) cfg.WebhookUrl = wUrl.Trim();
+                            if (wEnabled != null) cfg.WebhookEnabled = (wEnabled == "true" || wEnabled == "1");
+                            if (sMode != null) cfg.SoundMode = sMode;
+                            int interval;
+                            if (int.TryParse(intervalStr, out interval) && interval > 0) cfg.AlertIntervalSec = interval;
+
+                            ConfigManager.SaveConfig(cfg);
+                        }
+
+                        var ser = new JavaScriptSerializer();
+                        string json = ser.Serialize(new
+                        {
+                            webhookUrl = cfg.WebhookUrl,
+                            webhookEnabled = cfg.WebhookEnabled,
+                            webhookCooldownSec = cfg.WebhookCooldownSec,
+                            soundMode = cfg.SoundMode,
+                            alertIntervalSec = cfg.AlertIntervalSec,
+                            trayNotificationsEnabled = cfg.TrayNotificationsEnabled,
+                            customProcessNames = cfg.CustomProcessNames
+                        });
+
+                        byte[] buf = Encoding.UTF8.GetBytes(json);
+                        SendHttpResponse(stream, 200, "application/json; charset=utf-8", buf);
+                        return;
                     }
 
-                    string testMsg;
-                    bool ok = false;
-                    if (!string.IsNullOrEmpty(targetUrl))
+                    if (path == "/api/webhook/test")
                     {
-                        ok = WebhookManager.TestWebhook(targetUrl, out testMsg);
-                    }
-                    else
-                    {
-                        testMsg = "Nenhuma URL de Webhook informada.";
+                        string targetUrl;
+                        queryParams.TryGetValue("url", out targetUrl);
+                        if (string.IsNullOrEmpty(targetUrl))
+                        {
+                            var cfg = ConfigManager.GetConfig();
+                            targetUrl = cfg.WebhookUrl;
+                        }
+
+                        string testMsg;
+                        bool ok = false;
+                        if (!string.IsNullOrEmpty(targetUrl))
+                        {
+                            ok = WebhookManager.TestWebhook(targetUrl, out testMsg);
+                        }
+                        else
+                        {
+                            testMsg = "Nenhuma URL de Webhook informada.";
+                        }
+
+                        var ser = new JavaScriptSerializer();
+                        string json = ser.Serialize(new
+                        {
+                            success = ok,
+                            message = testMsg
+                        });
+
+                        byte[] buf = Encoding.UTF8.GetBytes(json);
+                        SendHttpResponse(stream, 200, "application/json; charset=utf-8", buf);
+                        return;
                     }
 
-                    var ser = new JavaScriptSerializer();
-                    string json = ser.Serialize(new
-                    {
-                        success = ok,
-                        message = testMsg
-                    });
-
-                    byte[] buf = Encoding.UTF8.GetBytes(json);
-                    res.ContentType = "application/json; charset=utf-8";
-                    res.ContentLength64 = buf.Length;
-                    res.OutputStream.Write(buf, 0, buf.Length);
-                    res.Close();
-                    return;
+                    byte[] notFoundBuf = Encoding.UTF8.GetBytes("{\"error\":\"Endpoint não encontrado\"}");
+                    SendHttpResponse(stream, 404, "application/json; charset=utf-8", notFoundBuf);
                 }
-
-                res.StatusCode = 404;
-                byte[] notFoundBuf = Encoding.UTF8.GetBytes("{\"error\":\"Endpoint não encontrado\"}");
-                res.ContentType = "application/json; charset=utf-8";
-                res.ContentLength64 = notFoundBuf.Length;
-                res.OutputStream.Write(notFoundBuf, 0, notFoundBuf.Length);
-                res.Close();
             }
-            catch (Exception ex)
+            catch { }
+        }
+
+        private static void SendHttpResponse(Stream stream, int statusCode, string contentType, byte[] body, string contentDisposition = null)
+        {
+            try
             {
-                try
+                string statusText = statusCode == 200 ? "OK" : (statusCode == 204 ? "No Content" : (statusCode == 404 ? "Not Found" : "Error"));
+                var sb = new StringBuilder();
+                sb.Append("HTTP/1.1 ").Append(statusCode).Append(" ").Append(statusText).Append("\r\n");
+                sb.Append("Content-Type: ").Append(contentType).Append("\r\n");
+                sb.Append("Content-Length: ").Append(body != null ? body.Length : 0).Append("\r\n");
+                sb.Append("Access-Control-Allow-Origin: *\r\n");
+                sb.Append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+                sb.Append("Access-Control-Allow-Headers: Content-Type\r\n");
+                sb.Append("Connection: close\r\n");
+                if (!string.IsNullOrEmpty(contentDisposition))
                 {
-                    res.StatusCode = 500;
-                    byte[] errBuf = Encoding.UTF8.GetBytes("{\"error\":\"" + ex.Message.Replace("\"", "\\\"") + "\"}");
-                    res.ContentType = "application/json; charset=utf-8";
-                    res.ContentLength64 = errBuf.Length;
-                    res.OutputStream.Write(errBuf, 0, errBuf.Length);
-                    res.Close();
+                    sb.Append("Content-Disposition: ").Append(contentDisposition).Append("\r\n");
                 }
-                catch { }
+                sb.Append("\r\n");
+
+                byte[] headBytes = Encoding.ASCII.GetBytes(sb.ToString());
+                stream.Write(headBytes, 0, headBytes.Length);
+                if (body != null && body.Length > 0)
+                {
+                    stream.Write(body, 0, body.Length);
+                }
+                stream.Flush();
             }
+            catch { }
         }
 
         #region Window Focus Logic
@@ -1510,6 +1690,26 @@ namespace AIProcessMonitor
                 {
                     friendly = "llama.cpp Inference Engine";
                     category = "Servidor de IA Local";
+                }
+
+                if (friendly == null)
+                {
+                    var customProcs = ConfigManager.GetConfig().CustomProcessNames;
+                    if (customProcs != null && customProcs.Count > 0)
+                    {
+                        foreach (var cp in customProcs)
+                        {
+                            if (string.IsNullOrEmpty(cp)) continue;
+                            string cleanCp = cp.Trim();
+                            if (pName.IndexOf(cleanCp, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                                pCmd.IndexOf(cleanCp, StringComparison.OrdinalIgnoreCase) >= 0)
+                            {
+                                friendly = cleanCp;
+                                category = "Processo Personalizado";
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 if (friendly != null)
@@ -1921,11 +2121,13 @@ namespace AIProcessMonitor
         // Header Sound Toggle Button (Modo Não Perturbe)
         private Button btnSoundToggle;
 
-        // Search, Filter, Export & History Controls (Fase 2 & 3)
+        // Search, Filter, Export, History, Mobile & Preferences (Fase 2, 3 & 4)
         private TextBox txtSearch;
         private ComboBox cmbStatusFilter;
         private Button btnExport;
         private Button btnHistory;
+        private Button btnMobile;
+        private Button btnSettings;
         private bool minimizeToTrayOnClose = true;
 
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
@@ -2161,6 +2363,47 @@ namespace AIProcessMonitor
                 }
             };
 
+            // Mobile QR Button (Fase 4)
+            btnMobile = new Button
+            {
+                Text = "📱 Mobile / QR",
+                Size = new Size(118, 30),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 8.8f, FontStyle.Bold)
+            };
+            btnMobile.FlatAppearance.BorderSize = 0;
+            btnMobile.Click += (s, e) =>
+            {
+                using (var mf = new MobileAccessForm(Program.LocalIp, apiPort))
+                {
+                    mf.ShowDialog(this);
+                }
+            };
+
+            // Settings & Preferences Button (Fase 4)
+            btnSettings = new Button
+            {
+                Text = "⚙️ Config.",
+                Size = new Size(88, 30),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 8.8f, FontStyle.Bold)
+            };
+            btnSettings.FlatAppearance.BorderSize = 0;
+            btnSettings.Click += (s, e) =>
+            {
+                using (var pf = new PreferencesConfigForm())
+                {
+                    pf.ShowDialog(this);
+                    ApplyPreferences();
+                }
+            };
+
             headerPanel.Controls.Add(lblTitle);
             headerPanel.Controls.Add(lblVersionBadge);
             headerPanel.Controls.Add(lblSubtitle);
@@ -2176,6 +2419,8 @@ namespace AIProcessMonitor
             headerPanel.Controls.Add(cmbStatusFilter);
             headerPanel.Controls.Add(btnExport);
             headerPanel.Controls.Add(btnHistory);
+            headerPanel.Controls.Add(btnMobile);
+            headerPanel.Controls.Add(btnSettings);
 
             Action layoutControls = () =>
             {
@@ -2185,12 +2430,16 @@ namespace AIProcessMonitor
                 cmbInterval.Location = new Point(headerPanel.Width - 515, 18);
                 lblInterval.Location = new Point(headerPanel.Width - 560, 22);
 
-                int historyX = headerPanel.Width - 118;
+                int settingsX = headerPanel.Width - 98;
+                int mobileX = settingsX - 126;
+                int historyX = mobileX - 108;
                 int exportX = historyX - 122;
                 int filterX = exportX - 170;
                 int searchX = filterX - 210;
-                if (searchX < 545) searchX = 545;
+                if (searchX < 450) searchX = 450;
 
+                btnSettings.Location = new Point(settingsX, 68);
+                btnMobile.Location = new Point(mobileX, 68);
                 btnHistory.Location = new Point(historyX, 68);
                 btnExport.Location = new Point(exportX, 68);
                 cmbStatusFilter.Location = new Point(filterX, 69);
@@ -2362,7 +2611,7 @@ namespace AIProcessMonitor
 
             statusLabel = new ToolStripStatusLabel
             {
-                Text = "● Monitor Ativo | API: http://localhost:" + apiPort,
+                Text = "● Monitor Ativo | Local: http://localhost:" + apiPort + " | LAN: http://" + Program.LocalIp + ":" + apiPort,
                 ForeColor = Color.FromArgb(34, 197, 94),
                 Spring = false
             };
@@ -2452,6 +2701,27 @@ namespace AIProcessMonitor
                 contextMenu.Items.Add(minTrayItem);
 
                 contextMenu.Items.Add("-");
+                contextMenu.Items.Add("📱 Conectar Celular (QR Code)...", null, (s, e) =>
+                {
+                    this.Show();
+                    this.WindowState = FormWindowState.Normal;
+                    this.BringToFront();
+                    using (var mf = new MobileAccessForm(Program.LocalIp, apiPort))
+                    {
+                        mf.ShowDialog(this);
+                    }
+                });
+                contextMenu.Items.Add("⚙️ Configurações & Preferências...", null, (s, e) =>
+                {
+                    this.Show();
+                    this.WindowState = FormWindowState.Normal;
+                    this.BringToFront();
+                    using (var pf = new PreferencesConfigForm())
+                    {
+                        pf.ShowDialog(this);
+                        ApplyPreferences();
+                    }
+                });
                 contextMenu.Items.Add("📋 Histórico de Alertas & Auditoria...", null, (s, e) =>
                 {
                     this.Show();
@@ -2486,6 +2756,21 @@ namespace AIProcessMonitor
                     this.Show();
                     this.WindowState = FormWindowState.Normal;
                     this.BringToFront();
+                };
+
+                trayIcon.BalloonTipClicked += (s, e) =>
+                {
+                    this.Show();
+                    this.WindowState = FormWindowState.Normal;
+                    this.BringToFront();
+                    this.Activate();
+
+                    var alertProc = currentProcesses.FirstOrDefault(p => p.needsHumanInput);
+                    if (alertProc != null)
+                    {
+                        string msg;
+                        Program.FocusProcessWindow(alertProc.pid, out msg);
+                    }
                 };
             }
             catch { }
@@ -2686,12 +2971,13 @@ namespace AIProcessMonitor
                     audioAlertTimer.Start();
                 }
 
-                if (!hadAlertBefore && trayIcon != null)
+                var cfg = ConfigManager.GetConfig();
+                if (!hadAlertBefore && trayIcon != null && cfg.TrayNotificationsEnabled)
                 {
                     try
                     {
-                        trayIcon.ShowBalloonTip(3000, "AI Process Monitor • Alerta",
-                            firstAlert.friendlyName + ": " + firstAlert.statusReason, ToolTipIcon.Warning);
+                        trayIcon.ShowBalloonTip(3500, "🚨 Ação Humana Necessária: " + firstAlert.friendlyName,
+                            firstAlert.statusReason + "\n(Clique aqui para focar no aplicativo)", ToolTipIcon.Warning);
                     }
                     catch { }
                 }
@@ -2753,14 +3039,12 @@ namespace AIProcessMonitor
             {
                 var p = filtered[i];
                 string statusDisplay = p.needsHumanInput ? "🔴 AÇÃO HUMANA" : "🟢 Ativo";
-                string nameDisplay = p.friendlyName + " (" + p.processName + ")";
-
                 int rowIndex = dgv.Rows.Add(
                     statusDisplay,
-                    nameDisplay,
+                    p.friendlyName,
                     p.category,
                     p.pid,
-                    p.cpuPercent.ToString("0.0") + " %",
+                    p.cpuPercent.ToString("0.0"),
                     p.memoryMB.ToString("0.0") + " MB",
                     p.uptimeHuman,
                     p.statusReason
@@ -2774,11 +3058,11 @@ namespace AIProcessMonitor
 
             if (!string.IsNullOrEmpty(query) || filterIdx > 0)
             {
-                statusLabel.Text = string.Format("● Filtrados: {0} de {1} processos | API: http://localhost:{2}", filtered.Count, currentProcesses.Count, apiPort);
+                statusLabel.Text = string.Format("● Filtrados: {0} de {1} processos | Local: http://localhost:{2} | LAN: http://{3}:{2}", filtered.Count, currentProcesses.Count, apiPort, Program.LocalIp);
             }
             else
             {
-                statusLabel.Text = string.Format("● Monitor Ativo ({0} processos) | API: http://localhost:{1}", currentProcesses.Count, apiPort);
+                statusLabel.Text = string.Format("● Monitor Ativo ({0} processos) | Local: http://localhost:{1} | LAN: http://{2}:{1}", currentProcesses.Count, apiPort, Program.LocalIp);
             }
         }
 
@@ -2958,17 +3242,42 @@ namespace AIProcessMonitor
             });
         }
 
+        public void ApplyPreferences()
+        {
+            var cfg = ConfigManager.GetConfig();
+            if (audioAlertTimer != null)
+            {
+                int sec = cfg.AlertIntervalSec > 0 ? cfg.AlertIntervalSec : 4;
+                audioAlertTimer.Interval = sec * 1000;
+            }
+        }
+
         private void PlayHumanAlertSound()
         {
             if (MuteManager.IsMuted) return;
 
-            try
+            var cfg = ConfigManager.GetConfig();
+            string mode = cfg.SoundMode ?? "VoiceMaria";
+            if (mode == "Silent") return;
+
+            if (mode == "Beep")
             {
-                System.Media.SystemSounds.Exclamation.Play();
+                try
+                {
+                    System.Media.SystemSounds.Exclamation.Play();
+                }
+                catch
+                {
+                    try { Console.Beep(1000, 200); } catch { }
+                }
             }
-            catch
+            else // VoiceMaria / Default
             {
-                try { Console.Beep(1000, 200); } catch { }
+                try
+                {
+                    System.Media.SystemSounds.Exclamation.Play();
+                }
+                catch { }
             }
         }
 
@@ -3878,6 +4187,421 @@ namespace AIProcessMonitor
             var curr = ConfigManager.GetConfig();
             txtUrl.Text = curr.WebhookUrl ?? "";
             chkEnabled.Checked = curr.WebhookEnabled;
+        }
+    }
+    #endregion
+
+    #region Mobile Access SubWindow (Fase 4)
+    public class MobileAccessForm : Form
+    {
+        public MobileAccessForm(string localIp, int port)
+        {
+            this.Text = "📱 Acesso no Celular / Tablet (QR Code & Wi-Fi)";
+            this.Size = new Size(490, 530);
+            this.StartPosition = FormStartPosition.CenterParent;
+            this.FormBorderStyle = FormBorderStyle.FixedDialog;
+            this.MaximizeBox = false;
+            this.MinimizeBox = false;
+            this.ShowInTaskbar = false;
+            this.BackColor = Color.FromArgb(15, 23, 42);
+            this.ForeColor = Color.FromArgb(248, 250, 252);
+            this.Font = new Font("Segoe UI", 9f);
+
+            string fullUrl = "http://" + localIp + ":" + port;
+
+            var lblTitle = new Label
+            {
+                Text = "📱 CONECTAR CELULAR / TABLET VIA WI-FI",
+                Location = new Point(24, 18),
+                AutoSize = true,
+                Font = new Font("Segoe UI", 11f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(56, 189, 248)
+            };
+
+            var lblSub = new Label
+            {
+                Text = "Aponte a câmera do seu celular conectado ao mesmo Wi-Fi para abrir o painel:",
+                Location = new Point(24, 46),
+                Size = new Size(430, 28),
+                ForeColor = Color.FromArgb(148, 163, 184)
+            };
+
+            var qrBox = new PictureBox
+            {
+                Location = new Point(135, 80),
+                Size = new Size(210, 210),
+                SizeMode = PictureBoxSizeMode.Zoom,
+                BackColor = Color.White,
+                BorderStyle = BorderStyle.FixedSingle
+            };
+
+            try
+            {
+                qrBox.Image = Program.GenerateQrCodeBitmap(fullUrl, 8);
+            }
+            catch (Exception ex)
+            {
+                lblSub.Text = "Erro ao gerar QR Code: " + ex.Message;
+            }
+
+            var cardUrl = new Panel
+            {
+                Location = new Point(24, 305),
+                Size = new Size(430, 46),
+                BackColor = Color.FromArgb(30, 41, 59),
+                BorderStyle = BorderStyle.FixedSingle
+            };
+
+            var lblUrl = new Label
+            {
+                Text = fullUrl,
+                Location = new Point(10, 10),
+                Size = new Size(410, 24),
+                Font = new Font("Consolas", 11.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(56, 189, 248),
+                TextAlign = ContentAlignment.MiddleCenter
+            };
+            cardUrl.Controls.Add(lblUrl);
+
+            var btnCopy = new Button
+            {
+                Text = "📋 Copiar URL",
+                Location = new Point(60, 365),
+                Size = new Size(130, 36),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(59, 130, 246),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+            };
+            btnCopy.FlatAppearance.BorderSize = 0;
+            btnCopy.Click += (s, e) =>
+            {
+                Clipboard.SetText(fullUrl);
+                btnCopy.Text = "✅ Copiado!";
+                var t = new System.Windows.Forms.Timer { Interval = 2000 };
+                t.Tick += (st, ev) => { t.Stop(); t.Dispose(); btnCopy.Text = "📋 Copiar URL"; };
+                t.Start();
+            };
+
+            var btnBrowser = new Button
+            {
+                Text = "🌐 Abrir no PC",
+                Location = new Point(200, 365),
+                Size = new Size(120, 36),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+            };
+            btnBrowser.FlatAppearance.BorderSize = 0;
+            btnBrowser.Click += (s, e) =>
+            {
+                try { Process.Start(new ProcessStartInfo(fullUrl) { UseShellExecute = true }); } catch { }
+            };
+
+            var btnClose = new Button
+            {
+                Text = "Fechar",
+                Location = new Point(330, 365),
+                Size = new Size(95, 36),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(30, 41, 59),
+                ForeColor = Color.FromArgb(203, 213, 225),
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9f)
+            };
+            btnClose.FlatAppearance.BorderSize = 0;
+            btnClose.Click += (s, e) => this.Close();
+
+            var lblTip = new Label
+            {
+                Text = "💡 Dica: No celular, toque no botão '🔊 Alarme Celular' para receber alertas sonoros e vibração no bolso quando uma IA precisar de atenção!",
+                Location = new Point(24, 418),
+                Size = new Size(430, 50),
+                ForeColor = Color.FromArgb(148, 163, 184),
+                Font = new Font("Segoe UI", 8.5f)
+            };
+
+            this.Controls.Add(lblTitle);
+            this.Controls.Add(lblSub);
+            this.Controls.Add(qrBox);
+            this.Controls.Add(cardUrl);
+            this.Controls.Add(btnCopy);
+            this.Controls.Add(btnBrowser);
+            this.Controls.Add(btnClose);
+            this.Controls.Add(lblTip);
+        }
+    }
+    #endregion
+
+    #region Preferences SubWindow (Fase 4)
+    public class PreferencesConfigForm : Form
+    {
+        private ComboBox cmbSoundMode;
+        private ComboBox cmbInterval;
+        private CheckBox chkTrayNotify;
+        private TextBox txtCustomProcs;
+        private Label lblStatus;
+
+        public PreferencesConfigForm()
+        {
+            this.Text = "⚙️ Configurações & Preferências do Monitor";
+            this.Size = new Size(580, 560);
+            this.StartPosition = FormStartPosition.CenterParent;
+            this.FormBorderStyle = FormBorderStyle.FixedDialog;
+            this.MaximizeBox = false;
+            this.MinimizeBox = false;
+            this.ShowInTaskbar = false;
+            this.BackColor = Color.FromArgb(15, 23, 42);
+            this.ForeColor = Color.FromArgb(248, 250, 252);
+            this.Font = new Font("Segoe UI", 9f);
+
+            var lblTitle = new Label
+            {
+                Text = "⚙️ PREFERÊNCIAS DO AI PROCESS MONITOR",
+                Location = new Point(24, 18),
+                AutoSize = true,
+                Font = new Font("Segoe UI", 11f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(56, 189, 248)
+            };
+
+            var lblSub = new Label
+            {
+                Text = "Ajuste o comportamento sonoro, notificações e processos monitorados:",
+                Location = new Point(24, 44),
+                Size = new Size(520, 20),
+                ForeColor = Color.FromArgb(148, 163, 184)
+            };
+
+            // Group 1: Som e Voz
+            var grpSound = new GroupBox
+            {
+                Text = "🔊 Alertas Sonoros e Sintetizador de Voz",
+                Location = new Point(24, 75),
+                Size = new Size(520, 110),
+                ForeColor = Color.FromArgb(148, 163, 184)
+            };
+
+            var lblSoundMode = new Label
+            {
+                Text = "Modo de Alerta Sonoro:",
+                Location = new Point(16, 30),
+                AutoSize = true,
+                ForeColor = Color.White
+            };
+
+            cmbSoundMode = new ComboBox
+            {
+                Location = new Point(190, 26),
+                Size = new Size(310, 26),
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(30, 41, 59),
+                ForeColor = Color.White
+            };
+            cmbSoundMode.Items.Add("Voz Sintetizada pt-BR (Microsoft Maria)");
+            cmbSoundMode.Items.Add("Bipe Clássico do Sistema");
+            cmbSoundMode.Items.Add("Silencioso (Apenas Alerta Visual)");
+
+            var lblInterval = new Label
+            {
+                Text = "Intervalo de Repetição:",
+                Location = new Point(16, 68),
+                AutoSize = true,
+                ForeColor = Color.White
+            };
+
+            cmbInterval = new ComboBox
+            {
+                Location = new Point(190, 64),
+                Size = new Size(180, 26),
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                BackColor = Color.FromArgb(30, 41, 59),
+                ForeColor = Color.White
+            };
+            cmbInterval.Items.Add("2 segundos");
+            cmbInterval.Items.Add("4 segundos (Padrão)");
+            cmbInterval.Items.Add("8 segundos");
+            cmbInterval.Items.Add("15 segundos");
+
+            grpSound.Controls.Add(lblSoundMode);
+            grpSound.Controls.Add(cmbSoundMode);
+            grpSound.Controls.Add(lblInterval);
+            grpSound.Controls.Add(cmbInterval);
+
+            // Group 2: Notificações
+            var grpNotify = new GroupBox
+            {
+                Text = "🔔 Notificações do Sistema",
+                Location = new Point(24, 195),
+                Size = new Size(520, 75),
+                ForeColor = Color.FromArgb(148, 163, 184)
+            };
+
+            chkTrayNotify = new CheckBox
+            {
+                Text = "Exibir balão de notificação (BalloonTip) no Windows ao detectar alerta",
+                Location = new Point(16, 26),
+                Size = new Size(490, 24),
+                ForeColor = Color.White,
+                Checked = true
+            };
+
+            var lblNotifyHint = new Label
+            {
+                Text = "💡 Clicar no balão restaura o monitor e foca diretamente no processo.",
+                Location = new Point(34, 48),
+                AutoSize = true,
+                Font = new Font("Segoe UI", 8.2f),
+                ForeColor = Color.FromArgb(148, 163, 184)
+            };
+
+            grpNotify.Controls.Add(chkTrayNotify);
+            grpNotify.Controls.Add(lblNotifyHint);
+
+            // Group 3: Processos Customizados
+            var grpCustom = new GroupBox
+            {
+                Text = "🤖 Processos Personalizados Adicionais",
+                Location = new Point(24, 280),
+                Size = new Size(520, 135),
+                ForeColor = Color.FromArgb(148, 163, 184)
+            };
+
+            var lblCustomPrompt = new Label
+            {
+                Text = "Nomes de executáveis ou comandos adicionais (um por linha, ex: meu_agente.exe):",
+                Location = new Point(16, 24),
+                AutoSize = true,
+                ForeColor = Color.FromArgb(203, 213, 225)
+            };
+
+            txtCustomProcs = new TextBox
+            {
+                Location = new Point(16, 48),
+                Size = new Size(485, 72),
+                Multiline = true,
+                ScrollBars = ScrollBars.Vertical,
+                BackColor = Color.FromArgb(30, 41, 59),
+                ForeColor = Color.FromArgb(248, 250, 252),
+                Font = new Font("Consolas", 9f),
+                BorderStyle = BorderStyle.FixedSingle
+            };
+
+            grpCustom.Controls.Add(lblCustomPrompt);
+            grpCustom.Controls.Add(txtCustomProcs);
+
+            lblStatus = new Label
+            {
+                Location = new Point(24, 425),
+                Size = new Size(520, 24),
+                Text = "",
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(34, 197, 94)
+            };
+
+            var btnOpenWebhook = new Button
+            {
+                Text = "🔔 Configurar Webhook...",
+                Location = new Point(24, 460),
+                Size = new Size(180, 36),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 8.8f)
+            };
+            btnOpenWebhook.FlatAppearance.BorderSize = 0;
+            btnOpenWebhook.Click += (s, e) =>
+            {
+                using (var wf = new WebhookConfigForm())
+                {
+                    wf.ShowDialog(this);
+                }
+            };
+
+            var btnCancel = new Button
+            {
+                Text = "Cancelar",
+                Location = new Point(310, 460),
+                Size = new Size(95, 36),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9f)
+            };
+            btnCancel.FlatAppearance.BorderSize = 0;
+            btnCancel.Click += (s, e) => this.Close();
+
+            var btnSave = new Button
+            {
+                Text = "💾 Salvar Preferências",
+                Location = new Point(415, 460),
+                Size = new Size(130, 36),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(16, 185, 129),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+            };
+            btnSave.FlatAppearance.BorderSize = 0;
+            btnSave.Click += (s, e) =>
+            {
+                var cfg = ConfigManager.GetConfig();
+                int smIdx = cmbSoundMode.SelectedIndex;
+                if (smIdx == 0) cfg.SoundMode = "VoiceMaria";
+                else if (smIdx == 1) cfg.SoundMode = "Beep";
+                else cfg.SoundMode = "Silent";
+
+                int ivIdx = cmbInterval.SelectedIndex;
+                if (ivIdx == 0) cfg.AlertIntervalSec = 2;
+                else if (ivIdx == 1) cfg.AlertIntervalSec = 4;
+                else if (ivIdx == 2) cfg.AlertIntervalSec = 8;
+                else cfg.AlertIntervalSec = 15;
+
+                cfg.TrayNotificationsEnabled = chkTrayNotify.Checked;
+
+                var lines = txtCustomProcs.Text.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                cfg.CustomProcessNames = lines.Select(l => l.Trim()).Where(l => !string.IsNullOrEmpty(l)).Distinct().ToList();
+
+                ConfigManager.SaveConfig(cfg);
+
+                lblStatus.Text = "✅ Preferências salvas com sucesso!";
+                lblStatus.ForeColor = Color.FromArgb(34, 197, 94);
+
+                var t = new System.Windows.Forms.Timer { Interval = 800 };
+                t.Tick += (st, ev) => { t.Stop(); t.Dispose(); this.Close(); };
+                t.Start();
+            };
+
+            this.Controls.Add(lblTitle);
+            this.Controls.Add(lblSub);
+            this.Controls.Add(grpSound);
+            this.Controls.Add(grpNotify);
+            this.Controls.Add(grpCustom);
+            this.Controls.Add(lblStatus);
+            this.Controls.Add(btnOpenWebhook);
+            this.Controls.Add(btnCancel);
+            this.Controls.Add(btnSave);
+
+            // Load existing
+            var curr = ConfigManager.GetConfig();
+            if (curr.SoundMode == "Beep") cmbSoundMode.SelectedIndex = 1;
+            else if (curr.SoundMode == "Silent") cmbSoundMode.SelectedIndex = 2;
+            else cmbSoundMode.SelectedIndex = 0;
+
+            if (curr.AlertIntervalSec == 2) cmbInterval.SelectedIndex = 0;
+            else if (curr.AlertIntervalSec == 8) cmbInterval.SelectedIndex = 2;
+            else if (curr.AlertIntervalSec == 15) cmbInterval.SelectedIndex = 3;
+            else cmbInterval.SelectedIndex = 1;
+
+            chkTrayNotify.Checked = curr.TrayNotificationsEnabled;
+            if (curr.CustomProcessNames != null && curr.CustomProcessNames.Count > 0)
+            {
+                txtCustomProcs.Text = string.Join(Environment.NewLine, curr.CustomProcessNames.ToArray());
+            }
         }
     }
     #endregion
