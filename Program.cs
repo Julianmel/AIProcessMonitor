@@ -21,9 +21,9 @@ using Microsoft.Win32;
 [assembly: AssemblyCompany("Julianmel")]
 [assembly: AssemblyProduct("AI Process Monitor")]
 [assembly: AssemblyCopyright("Copyright © 2026")]
-[assembly: AssemblyVersion("1.5.0.0")]
-[assembly: AssemblyFileVersion("1.5.0.0")]
-[assembly: AssemblyInformationalVersion("1.5.0")]
+[assembly: AssemblyVersion("1.6.0.0")]
+[assembly: AssemblyFileVersion("1.6.0.0")]
+[assembly: AssemblyInformationalVersion("1.6.0")]
 
 namespace AIProcessMonitor
 {
@@ -197,9 +197,388 @@ namespace AIProcessMonitor
     }
     #endregion
 
+    #region Configuration & Webhook Notification Manager
+    public class AppConfig
+    {
+        public string WebhookUrl { get; set; }
+        public bool WebhookEnabled { get; set; }
+        public int WebhookCooldownSec { get; set; }
+
+        public AppConfig()
+        {
+            WebhookUrl = "";
+            WebhookEnabled = false;
+            WebhookCooldownSec = 60;
+        }
+    }
+
+    public static class ConfigManager
+    {
+        private static readonly object configLock = new object();
+        private static AppConfig currentConfig = null;
+
+        public static string ConfigDir
+        {
+            get
+            {
+                string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AIProcessMonitor");
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                return dir;
+            }
+        }
+
+        public static string ConfigPath
+        {
+            get { return Path.Combine(ConfigDir, "config.json"); }
+        }
+
+        public static AppConfig GetConfig()
+        {
+            lock (configLock)
+            {
+                if (currentConfig != null) return currentConfig;
+
+                try
+                {
+                    if (File.Exists(ConfigPath))
+                    {
+                        string json = File.ReadAllText(ConfigPath, Encoding.UTF8);
+                        var ser = new JavaScriptSerializer();
+                        currentConfig = ser.Deserialize<AppConfig>(json) ?? new AppConfig();
+                        return currentConfig;
+                    }
+                }
+                catch { }
+
+                currentConfig = new AppConfig();
+                return currentConfig;
+            }
+        }
+
+        public static void SaveConfig(AppConfig cfg)
+        {
+            lock (configLock)
+            {
+                currentConfig = cfg;
+                try
+                {
+                    var ser = new JavaScriptSerializer();
+                    string json = ser.Serialize(cfg);
+                    File.WriteAllText(ConfigPath, json, Encoding.UTF8);
+                }
+                catch { }
+            }
+        }
+    }
+
+    public static class WebhookManager
+    {
+        private static DateTime lastSentTime = DateTime.MinValue;
+        private static string lastSentKey = null;
+        private static readonly object webhookLock = new object();
+
+        public static void SendAlertNotification(string processName, int pid, string reason)
+        {
+            var cfg = ConfigManager.GetConfig();
+            if (!cfg.WebhookEnabled || string.IsNullOrEmpty(cfg.WebhookUrl)) return;
+
+            string key = string.Format("{0}|{1}|{2}", processName, pid, reason);
+            var now = DateTime.Now;
+
+            lock (webhookLock)
+            {
+                if (key == lastSentKey && (now - lastSentTime).TotalSeconds < Math.Max(15, cfg.WebhookCooldownSec))
+                {
+                    return;
+                }
+                lastSentKey = key;
+                lastSentTime = now;
+            }
+
+            ThreadPool.QueueUserWorkItem(state =>
+            {
+                try
+                {
+                    PostWebhookPayload(cfg.WebhookUrl, processName, pid, reason);
+                }
+                catch { }
+            });
+        }
+
+        private static void PostWebhookPayload(string url, string processName, int pid, string reason)
+        {
+            var ser = new JavaScriptSerializer();
+            var payload = new
+            {
+                username = "AI Process Monitor",
+                content = string.Format("🚨 **Atenção:** `{0}` (PID {1}) aguarda sua ação humana no computador!\n> **Motivo:** {2}", processName, pid, reason),
+                embeds = new[]
+                {
+                    new
+                    {
+                        title = "🚨 Ação Humana Necessária: " + processName,
+                        description = reason,
+                        color = 15682620, // Red
+                        fields = new[]
+                        {
+                            new { name = "Processo / Agente", value = processName, @inline = true },
+                            new { name = "PID", value = pid.ToString(), @inline = true },
+                            new { name = "Horário", value = DateTime.Now.ToString("HH:mm:ss"), @inline = true }
+                        },
+                        footer = new { text = "AI Process Monitor v" + Program.AppVersion }
+                    }
+                }
+            };
+
+            string json = ser.Serialize(payload);
+            byte[] data = Encoding.UTF8.GetBytes(json);
+
+            var req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = "POST";
+            req.ContentType = "application/json; charset=utf-8";
+            req.UserAgent = "AIProcessMonitor-WebhookAgent";
+            req.Timeout = 10000;
+            req.ContentLength = data.Length;
+
+            using (var stream = req.GetRequestStream())
+            {
+                stream.Write(data, 0, data.Length);
+            }
+
+            using (var resp = (HttpWebResponse)req.GetResponse())
+            {
+                // OK
+            }
+        }
+
+        public static bool TestWebhook(string url, out string message)
+        {
+            try
+            {
+                var ser = new JavaScriptSerializer();
+                var payload = new
+                {
+                    username = "AI Process Monitor",
+                    content = "🔔 **Teste de Notificação Externa:** O Webhook foi configurado e conectado com sucesso ao **AI Process Monitor v" + Program.AppVersion + "**!",
+                    embeds = new[]
+                    {
+                        new
+                        {
+                            title = "✅ Conexão Estabelecida com Sucesso",
+                            description = "Você receberá alertas neste canal sempre que um processo de inteligência artificial solicitar ação humana.",
+                            color = 2278772, // Green
+                            fields = new[]
+                            {
+                                new { name = "Status", value = "Online / Operacional", @inline = true },
+                                new { name = "Data e Hora", value = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"), @inline = true }
+                            },
+                            footer = new { text = "AI Process Monitor • Teste de Webhook" }
+                        }
+                    }
+                };
+
+                string json = ser.Serialize(payload);
+                byte[] data = Encoding.UTF8.GetBytes(json);
+
+                var req = (HttpWebRequest)WebRequest.Create(url);
+                req.Method = "POST";
+                req.ContentType = "application/json; charset=utf-8";
+                req.UserAgent = "AIProcessMonitor-WebhookTest";
+                req.Timeout = 8000;
+                req.ContentLength = data.Length;
+
+                using (var stream = req.GetRequestStream())
+                {
+                    stream.Write(data, 0, data.Length);
+                }
+
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                {
+                    message = "Webhook disparado com sucesso (HTTP " + (int)resp.StatusCode + ").";
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                message = "Erro ao enviar webhook: " + ex.Message;
+                return false;
+            }
+        }
+    }
+    #endregion
+
+    #region Alert History & Audit Logging Manager
+    public class AlertEvent
+    {
+        public string Id { get; set; }
+        public int Pid { get; set; }
+        public string ProcessName { get; set; }
+        public string FriendlyName { get; set; }
+        public string Reason { get; set; }
+        public DateTime StartTime { get; set; }
+        public DateTime? ResolvedTime { get; set; }
+        public double? DurationSeconds { get; set; }
+        public bool IsResolved { get; set; }
+
+        public AlertEvent()
+        {
+            Id = Guid.NewGuid().ToString("N");
+            StartTime = DateTime.Now;
+            IsResolved = false;
+        }
+
+        public string FormattedDuration
+        {
+            get
+            {
+                if (!IsResolved)
+                {
+                    double wait = (DateTime.Now - StartTime).TotalSeconds;
+                    if (wait < 60) return string.Format("{0:0}s (aguardando)", wait);
+                    return string.Format("{0}m {1}s (aguardando)", (int)(wait / 60), (int)(wait % 60));
+                }
+                if (!DurationSeconds.HasValue) return "--";
+                double s = DurationSeconds.Value;
+                if (s < 60) return string.Format("{0:0} seg", s);
+                int m = (int)(s / 60);
+                int sec = (int)(s % 60);
+                return string.Format("{0}m {1}s", m, sec);
+            }
+        }
+    }
+
+    public static class AlertHistoryManager
+    {
+        private static readonly object historyLock = new object();
+        private static List<AlertEvent> events = null;
+        private static readonly Dictionary<int, AlertEvent> openAlerts = new Dictionary<int, AlertEvent>();
+
+        public static string HistoryPath
+        {
+            get { return Path.Combine(ConfigManager.ConfigDir, "alert_history.json"); }
+        }
+
+        private static void LoadIfNeeded()
+        {
+            if (events != null) return;
+            events = new List<AlertEvent>();
+            try
+            {
+                if (File.Exists(HistoryPath))
+                {
+                    string json = File.ReadAllText(HistoryPath, Encoding.UTF8);
+                    var ser = new JavaScriptSerializer();
+                    ser.MaxJsonLength = int.MaxValue;
+                    var loaded = ser.Deserialize<List<AlertEvent>>(json);
+                    if (loaded != null) events = loaded;
+                }
+            }
+            catch { }
+        }
+
+        private static void SaveInternal()
+        {
+            try
+            {
+                var ser = new JavaScriptSerializer();
+                ser.MaxJsonLength = int.MaxValue;
+                string json = ser.Serialize(events);
+                File.WriteAllText(HistoryPath, json, Encoding.UTF8);
+            }
+            catch { }
+        }
+
+        public static void RecordAlertState(List<ProcessInfo> currentProcs)
+        {
+            lock (historyLock)
+            {
+                LoadIfNeeded();
+                bool changed = false;
+
+                var activePids = new HashSet<int>();
+
+                if (currentProcs != null)
+                {
+                    foreach (var p in currentProcs)
+                    {
+                        if (p.needsHumanInput)
+                        {
+                            activePids.Add(p.pid);
+                            if (!openAlerts.ContainsKey(p.pid))
+                            {
+                                var ev = new AlertEvent
+                                {
+                                    Pid = p.pid,
+                                    ProcessName = p.processName,
+                                    FriendlyName = p.friendlyName,
+                                    Reason = p.statusReason,
+                                    StartTime = DateTime.Now,
+                                    IsResolved = false
+                                };
+                                openAlerts[p.pid] = ev;
+                                events.Insert(0, ev);
+                                if (events.Count > 500) events.RemoveAt(events.Count - 1);
+                                changed = true;
+
+                                // Trigger Webhook notification
+                                WebhookManager.SendAlertNotification(p.friendlyName, p.pid, p.statusReason);
+                            }
+                        }
+                    }
+                }
+
+                // Check alerts that were resolved
+                var pidsToClose = new List<int>();
+                foreach (var kvp in openAlerts)
+                {
+                    if (!activePids.Contains(kvp.Key))
+                    {
+                        pidsToClose.Add(kvp.Key);
+                    }
+                }
+
+                foreach (int pid in pidsToClose)
+                {
+                    var ev = openAlerts[pid];
+                    ev.ResolvedTime = DateTime.Now;
+                    ev.DurationSeconds = Math.Max(0, (ev.ResolvedTime.Value - ev.StartTime).TotalSeconds);
+                    ev.IsResolved = true;
+                    openAlerts.Remove(pid);
+                    changed = true;
+                }
+
+                if (changed)
+                {
+                    SaveInternal();
+                }
+            }
+        }
+
+        public static List<AlertEvent> GetEvents()
+        {
+            lock (historyLock)
+            {
+                LoadIfNeeded();
+                return new List<AlertEvent>(events);
+            }
+        }
+
+        public static void ClearHistory()
+        {
+            lock (historyLock)
+            {
+                LoadIfNeeded();
+                events.Clear();
+                openAlerts.Clear();
+                SaveInternal();
+            }
+        }
+    }
+    #endregion
+
     public static class Program
     {
-        public const string AppVersion = "1.5.0";
+        public const string AppVersion = "1.6.0";
         public const string BuildDate = "2026-09-13";
 
         public static int port = 3333;
@@ -620,6 +999,93 @@ namespace AIProcessMonitor
                     return;
                 }
 
+                if (path == "/api/history")
+                {
+                    var evs = AlertHistoryManager.GetEvents();
+                    var resolved = evs.Where(e => e.IsResolved && e.DurationSeconds.HasValue).ToList();
+                    double avgWait = resolved.Count > 0 ? Math.Round(resolved.Average(e => e.DurationSeconds.Value), 1) : 0.0;
+
+                    var ser = new JavaScriptSerializer();
+                    ser.MaxJsonLength = int.MaxValue;
+                    string json = ser.Serialize(new
+                    {
+                        totalAlerts = evs.Count,
+                        resolvedAlerts = resolved.Count,
+                        averageResponseSeconds = avgWait,
+                        events = evs
+                    });
+
+                    byte[] buf = Encoding.UTF8.GetBytes(json);
+                    res.ContentType = "application/json; charset=utf-8";
+                    res.ContentLength64 = buf.Length;
+                    res.OutputStream.Write(buf, 0, buf.Length);
+                    res.Close();
+                    return;
+                }
+
+                if (path == "/api/config")
+                {
+                    var cfg = ConfigManager.GetConfig();
+                    if (req.HttpMethod == "POST")
+                    {
+                        string wUrl = req.QueryString["webhookUrl"];
+                        string wEnabled = req.QueryString["webhookEnabled"];
+                        if (wUrl != null) cfg.WebhookUrl = wUrl.Trim();
+                        if (wEnabled != null) cfg.WebhookEnabled = (wEnabled == "true" || wEnabled == "1");
+                        ConfigManager.SaveConfig(cfg);
+                    }
+
+                    var ser = new JavaScriptSerializer();
+                    string json = ser.Serialize(new
+                    {
+                        webhookUrl = cfg.WebhookUrl,
+                        webhookEnabled = cfg.WebhookEnabled,
+                        webhookCooldownSec = cfg.WebhookCooldownSec
+                    });
+
+                    byte[] buf = Encoding.UTF8.GetBytes(json);
+                    res.ContentType = "application/json; charset=utf-8";
+                    res.ContentLength64 = buf.Length;
+                    res.OutputStream.Write(buf, 0, buf.Length);
+                    res.Close();
+                    return;
+                }
+
+                if (path == "/api/webhook/test")
+                {
+                    string targetUrl = req.QueryString["url"];
+                    if (string.IsNullOrEmpty(targetUrl))
+                    {
+                        var cfg = ConfigManager.GetConfig();
+                        targetUrl = cfg.WebhookUrl;
+                    }
+
+                    string testMsg;
+                    bool ok = false;
+                    if (!string.IsNullOrEmpty(targetUrl))
+                    {
+                        ok = WebhookManager.TestWebhook(targetUrl, out testMsg);
+                    }
+                    else
+                    {
+                        testMsg = "Nenhuma URL de Webhook informada.";
+                    }
+
+                    var ser = new JavaScriptSerializer();
+                    string json = ser.Serialize(new
+                    {
+                        success = ok,
+                        message = testMsg
+                    });
+
+                    byte[] buf = Encoding.UTF8.GetBytes(json);
+                    res.ContentType = "application/json; charset=utf-8";
+                    res.ContentLength64 = buf.Length;
+                    res.OutputStream.Write(buf, 0, buf.Length);
+                    res.Close();
+                    return;
+                }
+
                 res.StatusCode = 404;
                 byte[] notFoundBuf = Encoding.UTF8.GetBytes("{\"error\":\"Endpoint não encontrado\"}");
                 res.ContentType = "application/json; charset=utf-8";
@@ -987,6 +1453,62 @@ namespace AIProcessMonitor
                          pName.IndexOf("ollama", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     friendly = "Ollama Local LLM";
+                    category = "Servidor de IA Local";
+                }
+                else if (pCmd.IndexOf("aider", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         pName.IndexOf("aider", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    friendly = "Aider AI Pair Programmer";
+                    category = "Agente de IA / CLI";
+                }
+                else if (pName.IndexOf("cursor", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         pCmd.IndexOf("cursor.exe", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    friendly = "Cursor IDE (AI Editor)";
+                    category = "Assistente de IDE";
+                }
+                else if (pName.IndexOf("windsurf", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         pCmd.IndexOf("windsurf", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    friendly = "Windsurf IDE (Cascade AI)";
+                    category = "Assistente de IDE";
+                }
+                else if (pCmd.IndexOf("cline", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         pCmd.IndexOf("roo-cline", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         pCmd.IndexOf("roo-code", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    friendly = "Cline / Roo Code Agent";
+                    category = "Agente de IA / IDE";
+                }
+                else if (pCmd.IndexOf("opendevin", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         pCmd.IndexOf("all-hands", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    friendly = "OpenDevin Autonomous Agent";
+                    category = "Agente de IA / CLI";
+                }
+                else if (pCmd.IndexOf("continue", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                        (pCmd.IndexOf("extension", StringComparison.OrdinalIgnoreCase) >= 0 || pCmd.IndexOf("node", StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    friendly = "Continue.dev Assistant";
+                    category = "Assistente de IDE";
+                }
+                else if (pName.IndexOf("lm studio", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         pCmd.IndexOf("lmstudio", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    friendly = "LM Studio Local LLM";
+                    category = "Servidor de IA Local";
+                }
+                else if (pCmd.IndexOf("vllm", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         pCmd.IndexOf("localai", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    friendly = "vLLM / LocalAI Server";
+                    category = "Servidor de IA Local";
+                }
+                else if (pName.IndexOf("llama-server", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                         pName.IndexOf("llama-cli", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        (pName.IndexOf("main.exe", StringComparison.OrdinalIgnoreCase) >= 0 && pCmd.IndexOf("-m ", StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    friendly = "llama.cpp Inference Engine";
                     category = "Servidor de IA Local";
                 }
 
@@ -1399,10 +1921,11 @@ namespace AIProcessMonitor
         // Header Sound Toggle Button (Modo Não Perturbe)
         private Button btnSoundToggle;
 
-        // Search, Filter & Export Controls (Fase 2)
+        // Search, Filter, Export & History Controls (Fase 2 & 3)
         private TextBox txtSearch;
         private ComboBox cmbStatusFilter;
         private Button btnExport;
+        private Button btnHistory;
         private bool minimizeToTrayOnClose = true;
 
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
@@ -1618,6 +2141,26 @@ namespace AIProcessMonitor
             btnExport.FlatAppearance.BorderSize = 0;
             btnExport.Click += (s, e) => ShowExportMenu();
 
+            // History Button (Fase 3)
+            btnHistory = new Button
+            {
+                Text = "📋 Histórico",
+                Size = new Size(100, 30),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 8.8f, FontStyle.Bold)
+            };
+            btnHistory.FlatAppearance.BorderSize = 0;
+            btnHistory.Click += (s, e) =>
+            {
+                using (var hf = new AlertHistoryForm())
+                {
+                    hf.ShowDialog(this);
+                }
+            };
+
             headerPanel.Controls.Add(lblTitle);
             headerPanel.Controls.Add(lblVersionBadge);
             headerPanel.Controls.Add(lblSubtitle);
@@ -1632,6 +2175,7 @@ namespace AIProcessMonitor
             headerPanel.Controls.Add(txtSearch);
             headerPanel.Controls.Add(cmbStatusFilter);
             headerPanel.Controls.Add(btnExport);
+            headerPanel.Controls.Add(btnHistory);
 
             Action layoutControls = () =>
             {
@@ -1641,10 +2185,13 @@ namespace AIProcessMonitor
                 cmbInterval.Location = new Point(headerPanel.Width - 515, 18);
                 lblInterval.Location = new Point(headerPanel.Width - 560, 22);
 
-                int exportX = headerPanel.Width - 135;
-                int filterX = exportX - 175;
+                int historyX = headerPanel.Width - 118;
+                int exportX = historyX - 122;
+                int filterX = exportX - 170;
                 int searchX = filterX - 210;
                 if (searchX < 545) searchX = 545;
+
+                btnHistory.Location = new Point(historyX, 68);
                 btnExport.Location = new Point(exportX, 68);
                 cmbStatusFilter.Location = new Point(filterX, 69);
                 txtSearch.Location = new Point(searchX, 69);
@@ -1905,6 +2452,28 @@ namespace AIProcessMonitor
                 contextMenu.Items.Add(minTrayItem);
 
                 contextMenu.Items.Add("-");
+                contextMenu.Items.Add("📋 Histórico de Alertas & Auditoria...", null, (s, e) =>
+                {
+                    this.Show();
+                    this.WindowState = FormWindowState.Normal;
+                    this.BringToFront();
+                    using (var hf = new AlertHistoryForm())
+                    {
+                        hf.ShowDialog(this);
+                    }
+                });
+                contextMenu.Items.Add("🔔 Configurar Notificações (Webhook)...", null, (s, e) =>
+                {
+                    this.Show();
+                    this.WindowState = FormWindowState.Normal;
+                    this.BringToFront();
+                    using (var wf = new WebhookConfigForm())
+                    {
+                        wf.ShowDialog(this);
+                    }
+                });
+
+                contextMenu.Items.Add("-");
                 contextMenu.Items.Add("Sair", null, (s, e) =>
                 {
                     minimizeToTrayOnClose = false;
@@ -2091,6 +2660,7 @@ namespace AIProcessMonitor
         private void UpdateGridAndMetrics(List<ProcessInfo> list)
         {
             currentProcesses = list;
+            AlertHistoryManager.RecordAlertState(list);
 
             int alertCount = list.Count(p => p.needsHumanInput);
             double totalMem = Math.Round(list.Sum(p => p.memoryMB), 1);
@@ -2241,6 +2811,22 @@ namespace AIProcessMonitor
                 actionLabel.ForeColor = Color.FromArgb(34, 197, 94);
             };
             menu.Items.Add(minTrayItem);
+
+            menu.Items.Add("-");
+            menu.Items.Add("📋 Histórico de Alertas & Auditoria...", null, (s, e) =>
+            {
+                using (var hf = new AlertHistoryForm())
+                {
+                    hf.ShowDialog(this);
+                }
+            });
+            menu.Items.Add("🔔 Configurar Notificações (Webhook)...", null, (s, e) =>
+            {
+                using (var wf = new WebhookConfigForm())
+                {
+                    wf.ShowDialog(this);
+                }
+            });
 
             menu.Show(btnExport, new Point(0, btnExport.Height + 2));
         }
@@ -2847,6 +3433,451 @@ namespace AIProcessMonitor
         {
             if (graphRefreshTimer != null) graphRefreshTimer.Stop();
             base.OnFormClosing(e);
+        }
+    }
+    #endregion
+
+    #region Alert History & Audit SubWindow (Fase 3)
+    public class AlertHistoryForm : Form
+    {
+        private DataGridView dgvHistory;
+        private Label lblTotalAlerts;
+        private Label lblResolvedAlerts;
+        private Label lblAvgDuration;
+
+        public AlertHistoryForm()
+        {
+            this.Text = "📋 Histórico de Alertas & Auditoria de Ação Humana";
+            this.Size = new Size(940, 560);
+            this.MinimumSize = new Size(800, 440);
+            this.StartPosition = FormStartPosition.CenterParent;
+            this.BackColor = Color.FromArgb(15, 23, 42);
+            this.ForeColor = Color.FromArgb(248, 250, 252);
+            this.Font = new Font("Segoe UI", 9.5f);
+            this.KeyPreview = true;
+            this.KeyDown += (s, e) => { if (e.KeyCode == Keys.Escape) this.Close(); };
+
+            var header = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 110,
+                BackColor = Color.FromArgb(30, 41, 59),
+                Padding = new Padding(20, 12, 20, 10)
+            };
+
+            var lblTitle = new Label
+            {
+                Text = "📋 HISTÓRICO DE ALERTAS & AUDITORIA DE AÇÃO HUMANA",
+                Font = new Font("Segoe UI", 13f, FontStyle.Bold),
+                ForeColor = Color.White,
+                Location = new Point(20, 12),
+                AutoSize = true
+            };
+
+            var lblSub = new Label
+            {
+                Text = "Registro cronológico de pausas de agentes de IA, motivos de solicitação e tempo de resposta do operador",
+                Font = new Font("Segoe UI", 8.5f),
+                ForeColor = Color.FromArgb(148, 163, 184),
+                Location = new Point(22, 38),
+                AutoSize = true
+            };
+
+            var pnlCard1 = CreateSummaryCard("TOTAL DE EVENTOS", "0", Color.FromArgb(56, 189, 248), 20, 62, out lblTotalAlerts);
+            var pnlCard2 = CreateSummaryCard("ALERTAS ATENDIDOS", "0", Color.FromArgb(34, 197, 94), 195, 62, out lblResolvedAlerts);
+            var pnlCard3 = CreateSummaryCard("TEMPO MÉDIO DE RESPOSTA", "0s", Color.FromArgb(250, 204, 21), 370, 62, out lblAvgDuration);
+
+            header.Controls.Add(lblTitle);
+            header.Controls.Add(lblSub);
+            header.Controls.Add(pnlCard1);
+            header.Controls.Add(pnlCard2);
+            header.Controls.Add(pnlCard3);
+
+            var bottomBar = new Panel
+            {
+                Dock = DockStyle.Bottom,
+                Height = 50,
+                BackColor = Color.FromArgb(30, 41, 59),
+                Padding = new Padding(15, 8, 15, 8)
+            };
+
+            var btnRefresh = new Button
+            {
+                Text = "🔄 Atualizar",
+                Size = new Size(110, 32),
+                Location = new Point(15, 9),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+            };
+            btnRefresh.FlatAppearance.BorderSize = 0;
+            btnRefresh.Click += (s, e) => LoadData();
+
+            var btnExportCsv = new Button
+            {
+                Text = "📊 Exportar CSV",
+                Size = new Size(130, 32),
+                Location = new Point(135, 9),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(37, 99, 235),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+            };
+            btnExportCsv.FlatAppearance.BorderSize = 0;
+            btnExportCsv.Click += (s, e) => ExportCsv();
+
+            var btnClear = new Button
+            {
+                Text = "🗑️ Limpar Histórico",
+                Size = new Size(140, 32),
+                Location = new Point(275, 9),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(127, 29, 29),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9f)
+            };
+            btnClear.FlatAppearance.BorderSize = 0;
+            btnClear.Click += (s, e) =>
+            {
+                if (MessageBox.Show(this, "Deseja realmente limpar todo o histórico de alertas gravado?", "Confirmar Limpeza", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+                {
+                    AlertHistoryManager.ClearHistory();
+                    LoadData();
+                }
+            };
+
+            var btnClose = new Button
+            {
+                Text = "Fechar (ESC)",
+                Size = new Size(110, 32),
+                Anchor = AnchorStyles.Top | AnchorStyles.Right,
+                Location = new Point(bottomBar.Width - 125, 9),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(71, 85, 105),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9f)
+            };
+            btnClose.FlatAppearance.BorderSize = 0;
+            btnClose.Click += (s, e) => this.Close();
+
+            bottomBar.Controls.Add(btnRefresh);
+            bottomBar.Controls.Add(btnExportCsv);
+            bottomBar.Controls.Add(btnClear);
+            bottomBar.Controls.Add(btnClose);
+            bottomBar.Resize += (s, e) => { btnClose.Location = new Point(bottomBar.Width - 125, 9); };
+
+            dgvHistory = new DataGridView
+            {
+                Dock = DockStyle.Fill,
+                BackgroundColor = Color.FromArgb(15, 23, 42),
+                GridColor = Color.FromArgb(30, 41, 59),
+                BorderStyle = BorderStyle.None,
+                RowHeadersVisible = false,
+                AllowUserToAddRows = false,
+                AllowUserToDeleteRows = false,
+                ReadOnly = true,
+                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                MultiSelect = false,
+                EnableHeadersVisualStyles = false,
+                Font = new Font("Segoe UI", 9f),
+                RowTemplate = { Height = 32 }
+            };
+
+            dgvHistory.ColumnHeadersDefaultCellStyle = new DataGridViewCellStyle
+            {
+                BackColor = Color.FromArgb(30, 41, 59),
+                ForeColor = Color.FromArgb(148, 163, 184),
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold),
+                SelectionBackColor = Color.FromArgb(30, 41, 59),
+                SelectionForeColor = Color.FromArgb(148, 163, 184)
+            };
+
+            dgvHistory.DefaultCellStyle = new DataGridViewCellStyle
+            {
+                BackColor = Color.FromArgb(15, 23, 42),
+                ForeColor = Color.FromArgb(248, 250, 252),
+                SelectionBackColor = Color.FromArgb(15, 23, 42),
+                SelectionForeColor = Color.FromArgb(56, 189, 248)
+            };
+
+            dgvHistory.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Início", Width = 140 });
+            dgvHistory.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Agente / Processo", Width = 180 });
+            dgvHistory.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "PID", Width = 70 });
+            dgvHistory.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Motivo da Ação Humana", Width = 260, AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill });
+            dgvHistory.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Tempo de Resposta", Width = 140 });
+            dgvHistory.Columns.Add(new DataGridViewTextBoxColumn { HeaderText = "Status", Width = 110 });
+
+            this.Controls.Add(dgvHistory);
+            this.Controls.Add(bottomBar);
+            this.Controls.Add(header);
+
+            LoadData();
+        }
+
+        private Panel CreateSummaryCard(string title, string val, Color accent, int x, int y, out Label lblVal)
+        {
+            var pnl = new Panel { Size = new Size(165, 40), Location = new Point(x, y), BackColor = Color.FromArgb(15, 23, 42) };
+            var lblT = new Label { Text = title, Font = new Font("Segoe UI", 7f, FontStyle.Bold), ForeColor = Color.FromArgb(148, 163, 184), Location = new Point(6, 3), AutoSize = true };
+            var lblV = new Label { Text = val, Font = new Font("Segoe UI", 11f, FontStyle.Bold), ForeColor = accent, Location = new Point(6, 18), AutoSize = true };
+            pnl.Controls.Add(lblT);
+            pnl.Controls.Add(lblV);
+            lblVal = lblV;
+            return pnl;
+        }
+
+        private void LoadData()
+        {
+            var evs = AlertHistoryManager.GetEvents();
+            lblTotalAlerts.Text = evs.Count.ToString();
+            var resolved = evs.Where(e => e.IsResolved && e.DurationSeconds.HasValue).ToList();
+            lblResolvedAlerts.Text = resolved.Count.ToString();
+
+            if (resolved.Count > 0)
+            {
+                double avg = resolved.Average(e => e.DurationSeconds.Value);
+                if (avg < 60) lblAvgDuration.Text = string.Format("{0:0.0}s", avg);
+                else lblAvgDuration.Text = string.Format("{0}m {1}s", (int)(avg / 60), (int)(avg % 60));
+            }
+            else
+            {
+                lblAvgDuration.Text = "--";
+            }
+
+            dgvHistory.Rows.Clear();
+            foreach (var ev in evs)
+            {
+                string statusText = ev.IsResolved ? "🟢 Atendido" : "🔴 Em Aberto";
+                dgvHistory.Rows.Add(
+                    ev.StartTime.ToString("yyyy-MM-dd HH:mm:ss"),
+                    ev.FriendlyName,
+                    ev.Pid,
+                    ev.Reason,
+                    ev.FormattedDuration,
+                    statusText
+                );
+            }
+        }
+
+        private void ExportCsv()
+        {
+            var evs = AlertHistoryManager.GetEvents();
+            if (evs.Count == 0)
+            {
+                MessageBox.Show(this, "Nenhum histórico disponível para exportação.", "Aviso", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            using (var sfd = new SaveFileDialog())
+            {
+                sfd.Filter = "Arquivo CSV (*.csv)|*.csv|Todos os Arquivos (*.*)|*.*";
+                sfd.FileName = "alert_audit_history_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".csv";
+                if (sfd.ShowDialog(this) == DialogResult.OK)
+                {
+                    try
+                    {
+                        var sb = new StringBuilder();
+                        sb.AppendLine("ID,StartTime,ResolvedTime,DurationSeconds,ProcessName,FriendlyName,PID,Reason,IsResolved");
+                        foreach (var e in evs)
+                        {
+                            sb.AppendLine(string.Format("\"{0}\",\"{1:yyyy-MM-dd HH:mm:ss}\",\"{2}\",\"{3}\",\"{4}\",\"{5}\",\"{6}\",\"{7}\",\"{8}\"",
+                                e.Id,
+                                e.StartTime,
+                                (e.ResolvedTime.HasValue ? e.ResolvedTime.Value.ToString("yyyy-MM-dd HH:mm:ss") : ""),
+                                (e.DurationSeconds.HasValue ? e.DurationSeconds.Value.ToString("0.0") : ""),
+                                (e.ProcessName ?? "").Replace("\"", "\"\""),
+                                (e.FriendlyName ?? "").Replace("\"", "\"\""),
+                                e.Pid,
+                                (e.Reason ?? "").Replace("\"", "\"\""),
+                                e.IsResolved
+                            ));
+                        }
+                        File.WriteAllText(sfd.FileName, sb.ToString(), Encoding.UTF8);
+                        MessageBox.Show(this, "Histórico exportado com sucesso para:\n" + sfd.FileName, "Sucesso", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show(this, "Erro ao exportar CSV: " + ex.Message, "Erro", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+                }
+            }
+        }
+    }
+    #endregion
+
+    #region Webhook Configuration SubWindow (Fase 3)
+    public class WebhookConfigForm : Form
+    {
+        private TextBox txtUrl;
+        private CheckBox chkEnabled;
+        private Label lblStatus;
+        private Button btnTest;
+        private Button btnSave;
+
+        public WebhookConfigForm()
+        {
+            this.Text = "🔔 Configurar Notificações Externas (Webhook)";
+            this.Size = new Size(620, 310);
+            this.FormBorderStyle = FormBorderStyle.FixedDialog;
+            this.MaximizeBox = false;
+            this.MinimizeBox = false;
+            this.StartPosition = FormStartPosition.CenterParent;
+            this.BackColor = Color.FromArgb(15, 23, 42);
+            this.ForeColor = Color.FromArgb(248, 250, 252);
+            this.Font = new Font("Segoe UI", 9.5f);
+            this.KeyPreview = true;
+            this.KeyDown += (s, e) => { if (e.KeyCode == Keys.Escape) this.Close(); };
+
+            var lblTitle = new Label
+            {
+                Text = "🔔 NOTIFICAÇÕES EXTERNAS (DISCORD / SLACK / WEBHOOK)",
+                Font = new Font("Segoe UI", 11.5f, FontStyle.Bold),
+                ForeColor = Color.White,
+                Location = new Point(20, 15),
+                AutoSize = true
+            };
+
+            var lblSub = new Label
+            {
+                Text = "Envie alertas automáticos para seu canal ou automação externa quando a IA solicitar sua intervenção.",
+                Font = new Font("Segoe UI", 8.5f),
+                ForeColor = Color.FromArgb(148, 163, 184),
+                Location = new Point(22, 40),
+                AutoSize = true
+            };
+
+            chkEnabled = new CheckBox
+            {
+                Text = "Ativar notificações via Webhook ao detectar solicitações de ação humana",
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                ForeColor = Color.FromArgb(56, 189, 248),
+                Location = new Point(24, 75),
+                AutoSize = true
+            };
+
+            var lblUrlPrompt = new Label
+            {
+                Text = "Webhook URL (Discord, Slack, n8n, Zapier ou endpoint HTTP):",
+                Font = new Font("Segoe UI", 8.8f),
+                ForeColor = Color.FromArgb(203, 213, 225),
+                Location = new Point(22, 115),
+                AutoSize = true
+            };
+
+            txtUrl = new TextBox
+            {
+                Location = new Point(24, 138),
+                Size = new Size(555, 28),
+                BackColor = Color.FromArgb(30, 41, 59),
+                ForeColor = Color.White,
+                BorderStyle = BorderStyle.FixedSingle,
+                Font = new Font("Segoe UI", 9f)
+            };
+
+            lblStatus = new Label
+            {
+                Text = "",
+                Location = new Point(24, 175),
+                Size = new Size(555, 24),
+                ForeColor = Color.FromArgb(148, 163, 184),
+                Font = new Font("Segoe UI", 8.5f)
+            };
+
+            btnTest = new Button
+            {
+                Text = "🔔 Testar Envio",
+                Location = new Point(24, 215),
+                Size = new Size(130, 34),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+            };
+            btnTest.FlatAppearance.BorderSize = 0;
+            btnTest.Click += (s, e) =>
+            {
+                string url = txtUrl.Text.Trim();
+                if (string.IsNullOrEmpty(url))
+                {
+                    lblStatus.Text = "⚠️ Insira a URL do Webhook antes de testar.";
+                    lblStatus.ForeColor = Color.FromArgb(239, 68, 68);
+                    return;
+                }
+
+                btnTest.Enabled = false;
+                lblStatus.Text = "⏳ Enviando mensagem de teste...";
+                lblStatus.ForeColor = Color.FromArgb(250, 204, 21);
+
+                ThreadPool.QueueUserWorkItem(st =>
+                {
+                    string msg;
+                    bool ok = WebhookManager.TestWebhook(url, out msg);
+                    this.BeginInvoke((MethodInvoker)delegate
+                    {
+                        btnTest.Enabled = true;
+                        lblStatus.Text = ok ? "✅ " + msg : "❌ " + msg;
+                        lblStatus.ForeColor = ok ? Color.FromArgb(34, 197, 94) : Color.FromArgb(239, 68, 68);
+                    });
+                });
+            };
+
+            btnSave = new Button
+            {
+                Text = "💾 Salvar Configurações",
+                Location = new Point(410, 215),
+                Size = new Size(170, 34),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(16, 185, 129),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9f, FontStyle.Bold)
+            };
+            btnSave.FlatAppearance.BorderSize = 0;
+            btnSave.Click += (s, e) =>
+            {
+                var cfg = ConfigManager.GetConfig();
+                cfg.WebhookUrl = txtUrl.Text.Trim();
+                cfg.WebhookEnabled = chkEnabled.Checked;
+                ConfigManager.SaveConfig(cfg);
+                lblStatus.Text = "✅ Configurações salvas com sucesso!";
+                lblStatus.ForeColor = Color.FromArgb(34, 197, 94);
+                var t = new System.Windows.Forms.Timer { Interval = 800 };
+                t.Tick += (st, ev) => { t.Stop(); t.Dispose(); this.Close(); };
+                t.Start();
+            };
+
+            var btnCancel = new Button
+            {
+                Text = "Cancelar",
+                Location = new Point(310, 215),
+                Size = new Size(90, 34),
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(51, 65, 85),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand,
+                Font = new Font("Segoe UI", 9f)
+            };
+            btnCancel.FlatAppearance.BorderSize = 0;
+            btnCancel.Click += (s, e) => this.Close();
+
+            this.Controls.Add(lblTitle);
+            this.Controls.Add(lblSub);
+            this.Controls.Add(chkEnabled);
+            this.Controls.Add(lblUrlPrompt);
+            this.Controls.Add(txtUrl);
+            this.Controls.Add(lblStatus);
+            this.Controls.Add(btnTest);
+            this.Controls.Add(btnCancel);
+            this.Controls.Add(btnSave);
+
+            var curr = ConfigManager.GetConfig();
+            txtUrl.Text = curr.WebhookUrl ?? "";
+            chkEnabled.Checked = curr.WebhookEnabled;
         }
     }
     #endregion
