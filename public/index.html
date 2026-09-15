@@ -3,6 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#080c14">
+  <link rel="manifest" href="/manifest.json">
   <title>AI Process Monitor • Dashboard & Focus</title>
   <style>
     :root {
@@ -740,6 +745,10 @@
   </style>
 </head>
 <body>
+  <!-- Hidden Background Audio Keep-Alive and Chime elements -->
+  <audio id="bgSilenceAudio" loop preload="auto" src="/api/audio/silence.wav"></audio>
+  <audio id="alertChimeAudio" preload="auto" src="/api/audio/alert.wav"></audio>
+
   <div class="container">
     <!-- Header -->
     <header>
@@ -754,8 +763,11 @@
         <button id="btnMobileConnect" class="btn btn-primary" onclick="openQrModal()" title="Conectar smartphone no mesmo Wi-Fi via QR Code" style="display: inline-flex; align-items: center; gap: 6px;">
           📱 Celular (QR)
         </button>
-        <button id="btnMobileAudio" class="btn btn-secondary" onclick="enableMobileAudio()" title="Ativar alarme sonoro e vibração contínua no celular" style="display: inline-flex; align-items: center; gap: 6px;">
-          🔊 Alarme Celular: Off
+        <button id="btnMobileAudio" class="btn btn-secondary" onclick="enableMobileAudio()" title="Ativar execução em segundo plano, alarme sonoro e vibração contínua no celular" style="display: inline-flex; align-items: center; gap: 6px;">
+          📱 2º Plano & Alarme: OFF
+        </button>
+        <button id="btnWakeLock" class="btn btn-secondary" onclick="toggleWakeLock()" title="Evitar que a tela do celular apague enquanto você monitora" style="display: inline-flex; align-items: center; gap: 6px;">
+          💡 Tela Ativa: Off
         </button>
         <a href="/api/history" target="_blank" class="btn btn-secondary" title="Consultar histórico de alertas via API">
           📋 Histórico
@@ -974,9 +986,10 @@
     let previousAlertPids = new Set();
     let selectedPid = null;
 
-    // Audio & Mobile Vibration Support (Web Audio API & Vibration API)
+    // Audio, Background Execution & Mobile Notification Support
     let persistentAudioCtx = null;
     let mobileAudioEnabled = false;
+    let wakeLockSentinel = null;
 
     function initAudioContext() {
       try {
@@ -1006,64 +1019,132 @@
       document.addEventListener(evt, unlockAudio, { passive: true });
     });
 
+    async function toggleWakeLock() {
+      const btn = document.getElementById('btnWakeLock');
+      if (!('wakeLock' in navigator)) {
+        showToast("WakeLock não suportado neste navegador", "ℹ️");
+        return;
+      }
+      try {
+        if (!wakeLockSentinel) {
+          wakeLockSentinel = await navigator.wakeLock.request('screen');
+          wakeLockSentinel.addEventListener('release', () => {
+            wakeLockSentinel = null;
+            if (btn) { btn.textContent = '💡 Tela Ativa: Off'; btn.style.background = ''; btn.style.color = ''; }
+          });
+          if (btn) {
+            btn.textContent = '💡 Tela Ativa: LIGADA';
+            btn.style.background = '#f59e0b';
+            btn.style.color = '#000000';
+            btn.style.fontWeight = '700';
+          }
+          showToast("💡 Tela do celular configurada para não apagar!", "📱");
+        } else {
+          await wakeLockSentinel.release();
+          wakeLockSentinel = null;
+          if (btn) { btn.textContent = '💡 Tela Ativa: Off'; btn.style.background = ''; btn.style.color = ''; }
+          showToast("Modo tela ativa desligado", "💤");
+        }
+      } catch (err) {
+        console.warn("Wake lock error:", err);
+      }
+    }
+
     function enableMobileAudio() {
       unlockAudio();
       mobileAudioEnabled = !mobileAudioEnabled;
       const btn = document.getElementById('btnMobileAudio');
-      if (btn) {
-        if (mobileAudioEnabled) {
-          btn.textContent = '🔊 Alarme Celular: ATIVO';
+      const bgAudio = document.getElementById('bgSilenceAudio');
+
+      if (mobileAudioEnabled) {
+        // 1. Solicit Notification Permission if available
+        if ('Notification' in window && Notification.permission === 'default') {
+          Notification.requestPermission().catch(() => {});
+        }
+
+        // 2. Start Background Audio Loop to keep tab alive when screen locks
+        if (bgAudio) {
+          bgAudio.play().catch(e => console.warn("Background audio play err:", e));
+        }
+
+        // 3. Register MediaSession for native lockscreen notification
+        if ('mediaSession' in navigator) {
+          navigator.mediaSession.metadata = new MediaMetadata({
+            title: "⚡ AI Process Monitor",
+            artist: "Vigilante em 2º Plano • Rede Local",
+            album: "AI Process Monitor"
+          });
+          navigator.mediaSession.setActionHandler('play', () => bgAudio && bgAudio.play());
+          navigator.mediaSession.setActionHandler('pause', () => bgAudio && bgAudio.pause());
+        }
+
+        if (btn) {
+          btn.textContent = '📱 2º Plano & Alarme: ATIVO';
           btn.style.background = '#10b981';
           btn.style.color = '#ffffff';
           btn.style.borderColor = '#34d399';
-          playAlertChime();
-          showToast("🔊 Alarme sonoro e vibração ativados no celular!", "📱");
-        } else {
-          btn.textContent = '🔊 Alarme Celular: Off';
+        }
+        playAlertChime();
+        showToast("📱 Modo 2º plano ativo! O alarme tocará mesmo com a tela bloqueada.", "🔔");
+      } else {
+        if (bgAudio) {
+          try { bgAudio.pause(); } catch(e) {}
+        }
+        if (btn) {
+          btn.textContent = '📱 2º Plano & Alarme: OFF';
           btn.style.background = '';
           btn.style.color = '';
           btn.style.borderColor = '';
-          showToast("🔇 Alarme remoto no celular desativado", "🔕");
         }
+        showToast("🔇 Modo segundo plano desativado", "🔕");
       }
     }
 
     function playAlertChime() {
+      // 1. Play HTML5 Audio element (allowed in background on mobile)
+      try {
+        const audioEl = document.getElementById('alertChimeAudio');
+        if (audioEl) {
+          audioEl.currentTime = 0;
+          audioEl.play().catch(e => console.warn("HTML5 audio play blocked:", e));
+        }
+      } catch (e) {}
+
+      // 2. Play Web Audio API synthesized tone
       try {
         initAudioContext();
-        if (!persistentAudioCtx) return;
-        if (persistentAudioCtx.state === 'suspended') {
-          persistentAudioCtx.resume().catch(() => {});
+        if (persistentAudioCtx) {
+          if (persistentAudioCtx.state === 'suspended') {
+            persistentAudioCtx.resume().catch(() => {});
+          }
+          const ctx = persistentAudioCtx;
+          const now = ctx.currentTime;
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+
+          osc.type = 'triangle';
+          osc.frequency.setValueAtTime(659.25, now);
+          osc.frequency.setValueAtTime(880.00, now + 0.12);
+          osc.frequency.setValueAtTime(659.25, now + 0.24);
+          osc.frequency.setValueAtTime(880.00, now + 0.36);
+
+          gain.gain.setValueAtTime(0.4, now);
+          gain.gain.exponentialRampToValueAtTime(0.01, now + 0.55);
+
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+
+          osc.start(now);
+          osc.stop(now + 0.55);
         }
-        const ctx = persistentAudioCtx;
-        const now = ctx.currentTime;
+      } catch (e) {}
 
-        // Rhythmic dual-pulse alert (E5 -> A5 -> E5 -> A5)
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-
-        osc.type = 'triangle';
-        osc.frequency.setValueAtTime(659.25, now);
-        osc.frequency.setValueAtTime(880.00, now + 0.12);
-        osc.frequency.setValueAtTime(659.25, now + 0.24);
-        osc.frequency.setValueAtTime(880.00, now + 0.36);
-
-        gain.gain.setValueAtTime(0.35, now);
-        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.55);
-
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-
-        osc.start(now);
-        osc.stop(now + 0.55);
-
-        // Hardware Vibration on Mobile Devices
+      // 3. Hardware Vibration on Mobile Devices
+      try {
         if (navigator.vibrate) {
-          navigator.vibrate([250, 100, 250]);
+          navigator.vibrate([400, 200, 400, 200, 400]);
         }
-      } catch (e) {
-        console.warn("Audio Context bloqueado pelo navegador:", e);
-      }
+      } catch (e) {}
     }
 
     function openQrModal() {
@@ -1268,6 +1349,30 @@
     let repeatingAudioTimer = null;
     function handleAudioAlerts(hasAlert) {
       if (hasAlert) {
+        const alertProc = rawProcesses.find(p => p.needsHumanInput);
+        if (alertProc) {
+          // 1. Native Lockscreen Notification Card (MediaSession API)
+          if ('mediaSession' in navigator) {
+            navigator.mediaSession.metadata = new MediaMetadata({
+              title: `🚨 ${alertProc.friendlyName} PRECISA DE VOCÊ!`,
+              artist: `PID ${alertProc.pid} • ${alertProc.statusReason || 'Ação humana requerida'}`,
+              album: "AI Process Monitor"
+            });
+          }
+
+          // 2. Native System Push/Local Notification (Web Notifications API)
+          if ('Notification' in window && Notification.permission === 'granted') {
+            try {
+              new Notification(`🚨 AI Process Monitor: ${alertProc.friendlyName}`, {
+                body: `Atenção humana requerida: ${alertProc.statusReason || 'Processo aguardando autorização'}`,
+                tag: 'ai-alert-' + alertProc.pid,
+                renotify: true,
+                requireInteraction: true
+              });
+            } catch (e) {}
+          }
+        }
+
         if (!repeatingAudioTimer) {
           playAlertChime();
           repeatingAudioTimer = setInterval(playAlertChime, 4000);
@@ -1276,6 +1381,13 @@
         if (repeatingAudioTimer) {
           clearInterval(repeatingAudioTimer);
           repeatingAudioTimer = null;
+        }
+        if ('mediaSession' in navigator && mobileAudioEnabled) {
+          navigator.mediaSession.metadata = new MediaMetadata({
+            title: "⚡ AI Process Monitor",
+            artist: "Vigilante em 2º Plano • Tudo Normal",
+            album: "AI Process Monitor"
+          });
         }
       }
     }

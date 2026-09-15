@@ -861,6 +861,61 @@ namespace AIProcessMonitor
                 return ms.ToArray();
             }
         }
+
+        #region Audio WAV Generation for Background Mobile Playback
+        public static byte[] GenerateSilenceWav()
+        {
+            int sampleRate = 8000;
+            int numSamples = 800; // 0.1s silence
+            byte[] wav = new byte[44 + numSamples];
+            Encoding.ASCII.GetBytes("RIFF").CopyTo(wav, 0);
+            BitConverter.GetBytes(36 + numSamples).CopyTo(wav, 4);
+            Encoding.ASCII.GetBytes("WAVEfmt ").CopyTo(wav, 8);
+            BitConverter.GetBytes(16).CopyTo(wav, 16);
+            BitConverter.GetBytes((short)1).CopyTo(wav, 20);
+            BitConverter.GetBytes((short)1).CopyTo(wav, 22);
+            BitConverter.GetBytes(sampleRate).CopyTo(wav, 24);
+            BitConverter.GetBytes(sampleRate).CopyTo(wav, 28);
+            BitConverter.GetBytes((short)1).CopyTo(wav, 32);
+            BitConverter.GetBytes((short)8).CopyTo(wav, 34);
+            Encoding.ASCII.GetBytes("data").CopyTo(wav, 36);
+            BitConverter.GetBytes(numSamples).CopyTo(wav, 40);
+            for (int i = 0; i < numSamples; i++) wav[44 + i] = 128;
+            return wav;
+        }
+
+        public static byte[] GenerateAlertChimeWav()
+        {
+            int sampleRate = 16000;
+            double duration = 0.6;
+            int numSamples = (int)(sampleRate * duration);
+            byte[] wav = new byte[44 + numSamples];
+            Encoding.ASCII.GetBytes("RIFF").CopyTo(wav, 0);
+            BitConverter.GetBytes(36 + numSamples).CopyTo(wav, 4);
+            Encoding.ASCII.GetBytes("WAVEfmt ").CopyTo(wav, 8);
+            BitConverter.GetBytes(16).CopyTo(wav, 16);
+            BitConverter.GetBytes((short)1).CopyTo(wav, 20);
+            BitConverter.GetBytes((short)1).CopyTo(wav, 22);
+            BitConverter.GetBytes(sampleRate).CopyTo(wav, 24);
+            BitConverter.GetBytes(sampleRate).CopyTo(wav, 28);
+            BitConverter.GetBytes((short)1).CopyTo(wav, 32);
+            BitConverter.GetBytes((short)8).CopyTo(wav, 34);
+            Encoding.ASCII.GetBytes("data").CopyTo(wav, 36);
+            BitConverter.GetBytes(numSamples).CopyTo(wav, 40);
+
+            int half = numSamples / 2;
+            for (int i = 0; i < numSamples; i++)
+            {
+                double t = (double)i / sampleRate;
+                double freq = i < half ? 660.0 : 880.0;
+                int subIdx = i % half;
+                double decay = Math.Exp(-3.0 * subIdx / half);
+                double sample = Math.Sin(2.0 * Math.PI * freq * t) * decay;
+                wav[44 + i] = (byte)(128 + (int)(sample * 120));
+            }
+            return wav;
+        }
+        #endregion
         #endregion
 
         private static void StartServer()
@@ -999,6 +1054,28 @@ namespace AIProcessMonitor
                         string urlToEncode = "http://" + LocalIp + ":" + port;
                         byte[] qrBytes = GenerateQrCodePng(urlToEncode, 8);
                         SendHttpResponse(stream, 200, "image/png", qrBytes);
+                        return;
+                    }
+
+                    if (path == "/api/audio/silence.wav")
+                    {
+                        byte[] wav = GenerateSilenceWav();
+                        SendHttpResponse(stream, 200, "audio/wav", wav);
+                        return;
+                    }
+
+                    if (path == "/api/audio/alert.wav")
+                    {
+                        byte[] wav = GenerateAlertChimeWav();
+                        SendHttpResponse(stream, 200, "audio/wav", wav);
+                        return;
+                    }
+
+                    if (path == "/manifest.json")
+                    {
+                        string manifest = "{\"name\":\"AI Process Monitor\",\"short_name\":\"AI Monitor\",\"start_url\":\"/\",\"display\":\"standalone\",\"background_color\":\"#0a0f1d\",\"theme_color\":\"#6366f1\"}";
+                        byte[] buf = Encoding.UTF8.GetBytes(manifest);
+                        SendHttpResponse(stream, 200, "application/manifest+json; charset=utf-8", buf);
                         return;
                     }
 
