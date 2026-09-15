@@ -784,6 +784,22 @@
       </div>
     </header>
 
+    <!-- Mobile Background Setup Banner -->
+    <div id="mobileAlertBanner" style="display:none; background: linear-gradient(135deg, #1e3a8a, #1d4ed8); border: 1px solid #3b82f6; border-radius: 12px; padding: 14px 18px; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; box-shadow: 0 4px 16px rgba(59, 130, 246, 0.25);">
+      <div>
+        <div id="mobileBannerTitle" style="font-weight: 700; color: #ffffff; font-size: 0.95rem;">📱 Alerta em Segundo Plano com Tela Bloqueada</div>
+        <div id="mobileBannerDesc" style="font-size: 0.8rem; color: #bfdbfe;">Toque para ativar o monitoramento em 2º plano para o celular alarmar mesmo bloqueado no bolso:</div>
+      </div>
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button id="btnActivateBanner" class="btn btn-primary" onclick="enableMobileAudio()" style="font-weight: 700; background: #2563eb; border-color: #60a5fa;">
+          🔔 Ativar Modo 2º Plano
+        </button>
+        <button id="btnTestLockscreen" class="btn btn-secondary" onclick="testLockscreenCountdown()" style="font-weight: 600; display: inline-flex; align-items: center; gap: 4px;">
+          🧪 Testar com Tela Bloqueada (5s)
+        </button>
+      </div>
+    </div>
+
     <!-- Red Alert Banner for Human Attention -->
     <div id="alertBanner" class="alert-banner">
       <div class="alert-banner-content">
@@ -1050,11 +1066,20 @@
       }
     }
 
-    function enableMobileAudio() {
+    function enableMobileAudio(forceState) {
       unlockAudio();
-      mobileAudioEnabled = !mobileAudioEnabled;
+      if (forceState !== undefined) {
+        mobileAudioEnabled = forceState;
+      } else {
+        mobileAudioEnabled = !mobileAudioEnabled;
+      }
+
       const btn = document.getElementById('btnMobileAudio');
       const bgAudio = document.getElementById('bgSilenceAudio');
+      const bannerBtn = document.getElementById('btnActivateBanner');
+      const bannerTitle = document.getElementById('mobileBannerTitle');
+      const bannerDesc = document.getElementById('mobileBannerDesc');
+      const bannerPnl = document.getElementById('mobileAlertBanner');
 
       if (mobileAudioEnabled) {
         // 1. Solicit Notification Permission if available
@@ -1084,6 +1109,15 @@
           btn.style.color = '#ffffff';
           btn.style.borderColor = '#34d399';
         }
+        if (bannerPnl) bannerPnl.style.background = 'linear-gradient(135deg, #065f46, #047857)';
+        if (bannerTitle) bannerTitle.textContent = '✅ Modo 2º Plano e Alarme ATIVO';
+        if (bannerDesc) bannerDesc.textContent = 'O monitoramento continuará operando. Você pode bloquear a tela do celular com tranquilidade.';
+        if (bannerBtn) {
+          bannerBtn.textContent = '✅ Ativado';
+          bannerBtn.style.background = '#10b981';
+          bannerBtn.style.borderColor = '#34d399';
+        }
+
         playAlertChime();
         showToast("📱 Modo 2º plano ativo! O alarme tocará mesmo com a tela bloqueada.", "🔔");
       } else {
@@ -1096,8 +1130,61 @@
           btn.style.color = '';
           btn.style.borderColor = '';
         }
+        if (bannerPnl) bannerPnl.style.background = 'linear-gradient(135deg, #1e3a8a, #1d4ed8)';
+        if (bannerTitle) bannerTitle.textContent = '📱 Alerta em Segundo Plano com Tela Bloqueada';
+        if (bannerDesc) bannerDesc.textContent = 'Toque para ativar o monitoramento em 2º plano para o celular alarmar mesmo bloqueado no bolso:';
+        if (bannerBtn) {
+          bannerBtn.textContent = '🔔 Ativar Modo 2º Plano';
+          bannerBtn.style.background = '#2563eb';
+          bannerBtn.style.borderColor = '#60a5fa';
+        }
+
         showToast("🔇 Modo segundo plano desativado", "🔕");
       }
+    }
+
+    let testTimer = null;
+    function testLockscreenCountdown() {
+      enableMobileAudio(true);
+      showToast("⏳ Bloqueie a tela do celular AGORA! O alarme tocará em 5 segundos...", "📱");
+      let count = 5;
+      const btn = document.getElementById('btnTestLockscreen');
+      if (btn) btn.textContent = '⏳ Disparando em 5s...';
+      if (testTimer) clearInterval(testTimer);
+
+      testTimer = setInterval(() => {
+        count--;
+        if (btn && count > 0) btn.textContent = `⏳ Disparando em ${count}s...`;
+        if (count <= 0) {
+          clearInterval(testTimer);
+          testTimer = null;
+          if (btn) btn.textContent = '🧪 Testar com Tela Bloqueada (5s)';
+
+          // Trigger lockscreen notification card
+          if ('mediaSession' in navigator) {
+            navigator.mediaSession.metadata = new MediaMetadata({
+              title: "🚨 TESTE: ALARME DE AÇÃO HUMANA!",
+              artist: "AI Process Monitor • Teste de Tela Bloqueada OK",
+              album: "AI Process Monitor"
+            });
+          }
+
+          // Trigger sound and vibration
+          playAlertChime();
+
+          // Native system notification
+          if ('Notification' in window && Notification.permission === 'granted') {
+            try {
+              new Notification("🚨 TESTE: AI Process Monitor", {
+                body: "Alarme com tela bloqueada acionado com sucesso!",
+                tag: "ai-test-alert",
+                renotify: true
+              });
+            } catch (e) {}
+          }
+          showToast("🔔 Alarme disparado com sucesso!", "✅");
+        }
+      }, 1000);
     }
 
     function playAlertChime() {
@@ -1624,7 +1711,51 @@
       requestAnimationFrame(updateProgress);
     }
 
+    // Server-Sent Events (SSE) for Real-Time Background Mobile Push
+    let sseSource = null;
+    function initSse() {
+      if (sseSource) return;
+      try {
+        sseSource = new EventSource('/api/stream');
+        sseSource.onmessage = function(e) {
+          try {
+            if (!e.data || e.data.startsWith(':')) return;
+            const data = JSON.parse(e.data);
+            if (data && data.processes) {
+              rawProcesses = data.processes;
+              checkNewAlerts(rawProcesses);
+              renderTable();
+              updateStats(data);
+              document.getElementById('stat-status').textContent = 'Conectado (Stream em Tempo Real)';
+              document.getElementById('stat-latency').textContent = '0 ms';
+            }
+          } catch(err) {}
+        };
+        sseSource.onerror = function() {
+          // EventSource will automatically reconnect
+        };
+      } catch(e) {}
+    }
+
+    // Web Worker Background Timer (immune to mobile browser tab suspension when screen locked)
+    try {
+      const workerBlob = new Blob([
+        "setInterval(function() { postMessage('tick'); }, 2500);"
+      ], { type: 'application/javascript' });
+      const bgWorker = new Worker(URL.createObjectURL(workerBlob));
+      bgWorker.onmessage = function() {
+        if (!isPaused) {
+          fetchProcesses();
+        }
+      };
+    } catch(e) {}
+
     // Initial Start
+    if (/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {
+      const mobBanner = document.getElementById('mobileAlertBanner');
+      if (mobBanner) mobBanner.style.display = 'flex';
+    }
+    initSse();
     fetchProcesses();
     restartPolling();
     requestAnimationFrame(updateProgress);

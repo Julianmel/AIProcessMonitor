@@ -942,6 +942,44 @@ namespace AIProcessMonitor
             }
         }
 
+        #region Server-Sent Events (SSE) for Real-Time Background Mobile Push
+        private static readonly List<TcpClient> sseClients = new List<TcpClient>();
+        private static readonly object sseLock = new object();
+
+        public static void BroadcastSseEvent(string eventData)
+        {
+            if (string.IsNullOrEmpty(eventData)) return;
+            ThreadPool.QueueUserWorkItem(state =>
+            {
+                lock (sseLock)
+                {
+                    byte[] bytes = Encoding.UTF8.GetBytes("data: " + eventData + "\n\n");
+                    for (int i = sseClients.Count - 1; i >= 0; i--)
+                    {
+                        try
+                        {
+                            var c = sseClients[i];
+                            if (c.Connected)
+                            {
+                                var stm = c.GetStream();
+                                stm.Write(bytes, 0, bytes.Length);
+                                stm.Flush();
+                            }
+                            else
+                            {
+                                sseClients.RemoveAt(i);
+                            }
+                        }
+                        catch
+                        {
+                            sseClients.RemoveAt(i);
+                        }
+                    }
+                }
+            });
+        }
+        #endregion
+
         private static void ListenLoop(object state)
         {
             while (tcpServer != null)
@@ -1076,6 +1114,48 @@ namespace AIProcessMonitor
                         string manifest = "{\"name\":\"AI Process Monitor\",\"short_name\":\"AI Monitor\",\"start_url\":\"/\",\"display\":\"standalone\",\"background_color\":\"#0a0f1d\",\"theme_color\":\"#6366f1\"}";
                         byte[] buf = Encoding.UTF8.GetBytes(manifest);
                         SendHttpResponse(stream, 200, "application/manifest+json; charset=utf-8", buf);
+                        return;
+                    }
+
+                    if (path == "/api/stream")
+                    {
+                        try
+                        {
+                            string sseHead = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n";
+                            byte[] headBytes = Encoding.ASCII.GetBytes(sseHead);
+                            stream.Write(headBytes, 0, headBytes.Length);
+                            stream.Flush();
+
+                            string initialJson = GetProcessesJson();
+                            byte[] initBytes = Encoding.UTF8.GetBytes("data: " + initialJson + "\n\n");
+                            stream.Write(initBytes, 0, initBytes.Length);
+                            stream.Flush();
+
+                            lock (sseLock)
+                            {
+                                sseClients.Add(client);
+                            }
+
+                            while (client.Connected)
+                            {
+                                Thread.Sleep(3000);
+                                try
+                                {
+                                    byte[] ping = Encoding.UTF8.GetBytes(": ping\n\n");
+                                    stream.Write(ping, 0, ping.Length);
+                                    stream.Flush();
+                                }
+                                catch
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        catch { }
+                        finally
+                        {
+                            lock (sseLock) { sseClients.Remove(client); }
+                        }
                         return;
                     }
 
@@ -3023,6 +3103,7 @@ namespace AIProcessMonitor
         {
             currentProcesses = list;
             AlertHistoryManager.RecordAlertState(list);
+            Program.BroadcastSseEvent(Program.GetProcessesJson());
 
             int alertCount = list.Count(p => p.needsHumanInput);
             double totalMem = Math.Round(list.Sum(p => p.memoryMB), 1);
